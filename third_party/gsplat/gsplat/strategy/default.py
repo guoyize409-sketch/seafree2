@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -103,6 +103,10 @@ class DefaultStrategy(Strategy):
     reset_alpha_value: float = -1.0
     cull_alpha_thresh_post: float = -1.0
     continue_cull_post_densification: bool = True
+    external_prune_mask: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
+    external_no_grow_mask: Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
+    last_external_prune_count: int = field(default=0, init=False)
+    last_external_no_grow_count: int = field(default=0, init=False)
     
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
@@ -120,6 +124,14 @@ class DefaultStrategy(Strategy):
         if self.refine_scale2d_stop_iter > 0:
             state["radii"] = None
         return state
+
+    def set_external_prune_mask(self, mask: Optional[torch.Tensor]):
+        """Set an optional, one-shot Gaussian prune mask supplied by a model-specific prior."""
+        self.external_prune_mask = mask.detach().bool() if mask is not None else None
+
+    def set_external_no_grow_mask(self, mask: Optional[torch.Tensor]):
+        """Set an optional, one-shot Gaussian duplicate/split block mask."""
+        self.external_no_grow_mask = mask.detach().bool() if mask is not None else None
 
     def check_sanity(
         self,
@@ -175,6 +187,12 @@ class DefaultStrategy(Strategy):
             return
 
         self._update_state(params, state, info, packed=packed)
+        external_prune_mask = self.external_prune_mask
+        external_no_grow_mask = self.external_no_grow_mask
+        self.external_prune_mask = None
+        self.external_no_grow_mask = None
+        self.last_external_prune_count = 0
+        self.last_external_no_grow_count = 0
 
         if (
             step > self.refine_start_iter
@@ -182,8 +200,32 @@ class DefaultStrategy(Strategy):
             and step % self.reset_every >= self.pause_refine_after_reset
             and step < self.refine_stop_iter
         ):
+            # Model-specific priors can prune invalid Gaussians before growth so
+            # they are not duplicated or split by high image-plane gradients.
+            n_prior_prune = self._prune_gs(
+                params,
+                optimizers,
+                state,
+                step,
+                extra_prune_mask=external_prune_mask,
+                include_standard_prune=False,
+            )
+            self.last_external_prune_count = n_prior_prune
+            external_prune_mask = None
+            if self.verbose and n_prior_prune > 0:
+                print(
+                    f"Step {step}: {n_prior_prune} GSs pruned by external prior. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
             # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            n_dupli, n_split = self._grow_gs(
+                params,
+                optimizers,
+                state,
+                step,
+                block_grow_mask=external_no_grow_mask,
+            )
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
@@ -215,7 +257,15 @@ class DefaultStrategy(Strategy):
             # configurable threshold to clean up residual transparent points.
             self.prune_opa = self.cull_alpha_thresh_post if self.cull_alpha_thresh_post > 0 else self.prune_opa
             # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
+            n_prune = self._prune_gs(
+                params,
+                optimizers,
+                state,
+                step,
+                extra_prune_mask=external_prune_mask,
+            )
+            if external_prune_mask is not None and external_prune_mask.shape[0] == len(params["means"]):
+                self.last_external_prune_count = int(external_prune_mask.sum().item())
             if self.verbose:
                 print(
                     f"Step {step}: {n_prune} GSs pruned. "
@@ -309,6 +359,7 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
+        block_grow_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
@@ -320,12 +371,19 @@ class DefaultStrategy(Strategy):
             <= self.grow_scale3d * state["scene_scale"]
         )
         is_dupli = is_grad_high & is_small
-        n_dupli = is_dupli.sum().item()
 
         is_large = ~is_small
         is_split = is_grad_high & is_large
         if step < self.refine_scale2d_stop_iter:
             is_split |= state["radii"] > self.grow_scale2d
+
+        if block_grow_mask is not None and block_grow_mask.shape[0] == is_dupli.shape[0]:
+            block_grow_mask = block_grow_mask.to(device=device, dtype=torch.bool)
+            self.last_external_no_grow_count = int(block_grow_mask.sum().item())
+            is_dupli &= ~block_grow_mask
+            is_split &= ~block_grow_mask
+
+        n_dupli = is_dupli.sum().item()
         n_split = is_split.sum().item()
 
         # first duplicate
@@ -358,9 +416,18 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
+        extra_prune_mask: Optional[torch.Tensor] = None,
+        include_standard_prune: bool = True,
     ) -> int:
-        is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
-        if step > self.reset_every:
+        if include_standard_prune:
+            is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+        else:
+            is_prune = torch.zeros(
+                len(params["means"]),
+                dtype=torch.bool,
+                device=params["means"].device,
+            )
+        if include_standard_prune and step > self.reset_every:
             is_too_big = (
                 torch.exp(params["scales"]).max(dim=-1).values
                 > self.prune_scale3d * state["scene_scale"]
@@ -374,6 +441,9 @@ class DefaultStrategy(Strategy):
                 is_too_big |= state["radii"] > self.prune_scale2d
 
             is_prune = is_prune | is_too_big
+
+        if extra_prune_mask is not None and extra_prune_mask.shape[0] == is_prune.shape[0]:
+            is_prune = is_prune | extra_prune_mask.to(is_prune.device)
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
