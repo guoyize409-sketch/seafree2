@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
@@ -208,12 +209,12 @@ def find_matching_gt_file(pred_file: Path, gt_dir: Path, gt_index: Optional[int]
         if cand.exists():
             return cand
 
-    # 若预测文件名包含数字，基于索引匹配
-    import re
-
-    match = re.search(r"(\d+)", pred_stem)
+    # 若预测文件名包含数字，基于最后一个数字匹配。
+    # Seafree 扁平输出形如 eval_intrinsic_color_render_0014.png。
+    matches = re.findall(r"(\d+)", pred_stem)
+    match = matches[-1] if matches else None
     if match:
-        idx = match.group(1)
+        idx = match
         candidates = [
             gt_dir / f"{idx}.png",
             gt_dir / f"{idx}.jpg",
@@ -229,7 +230,7 @@ def find_matching_gt_file(pred_file: Path, gt_dir: Path, gt_index: Optional[int]
     # 兜底：按排序索引匹配
     all_files = sorted([p for p in gt_dir.glob("*") if p.is_file()])
     if match:
-        idx_int = int(match.group(1))
+        idx_int = int(match)
         if 0 <= idx_int < len(all_files):
             return all_files[idx_int]
     if len(all_files) == 1:
@@ -244,11 +245,83 @@ def list_pred_images(pred_dir: Path, pred_glob: str) -> List[Path]:
     默认只评估常见图像格式；可通过 pred_glob 指定更精确的模式（如 \"*.png\"）。
     """
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    seafree_intrinsic_exact = re.compile(
+        r"^eval_intrinsic_color_render_\d+\.(png|jpg|jpeg|bmp|tif|tiff)$",
+        re.IGNORECASE,
+    )
     files = []
     for p in sorted(pred_dir.glob(pred_glob)):
-        if p.is_file() and p.suffix.lower() in exts:
-            files.append(p)
+        if not p.is_file() or p.suffix.lower() not in exts:
+            continue
+        # SeaFree 同目录下可能同时存在 eval_intrinsic_color_render_raw_*.png。
+        # auto 模式只评估最终可视化输出，避免 raw 图被重复计入指标。
+        if pred_glob == "eval_intrinsic_color_render_*.png" and not seafree_intrinsic_exact.match(p.name):
+            continue
+        files.append(p)
     return files
+
+
+def list_gt_images(gt_dir: Path) -> List[Path]:
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    if not gt_dir.exists() or not gt_dir.is_dir():
+        return []
+    return sorted([p for p in gt_dir.glob("*") if p.is_file() and p.suffix.lower() in exts])
+
+
+def resolve_pred_input(pred_input: Path, pred_glob: str) -> Tuple[Path, str]:
+    """
+    Resolve normal prediction directories and Seafree eval_renders flat prefixes.
+
+    Supported examples:
+      - /path/to/clear
+      - /path/to/eval_renders with --pred-glob auto
+      - /path/to/eval_renders/eval_intrinsic_color_render
+    """
+    if pred_input.exists():
+        if pred_input.is_file():
+            return pred_input.parent, pred_input.name
+        if pred_glob != "auto":
+            return pred_input, pred_glob
+        seafree_glob = "eval_intrinsic_color_render_*.png"
+        if list_pred_images(pred_input, seafree_glob):
+            return pred_input, seafree_glob
+        return pred_input, "*.png"
+
+    parent = pred_input.parent
+    prefix = pred_input.name
+    if parent.exists() and prefix:
+        prefix_glob = f"{prefix}_*.png"
+        if list_pred_images(parent, prefix_glob):
+            return parent, prefix_glob
+        loose_glob = f"{prefix}*.png"
+        if list_pred_images(parent, loose_glob):
+            return parent, loose_glob
+    return pred_input, pred_glob
+
+
+def default_output_path(pred_dir: Path, pred_glob: str) -> Path:
+    if pred_glob.startswith("eval_intrinsic_color_render"):
+        return pred_dir / "clear_results.json"
+    return pred_dir / "eval_rgb_clear_results.json"
+
+
+def infer_gt_index_stride(pred_files: List[Path], gt_dir: Path, pred_glob: str, stride_arg: str) -> Optional[int]:
+    if stride_arg not in ("auto", "", None):
+        if stride_arg.lower() in ("none", "name"):
+            return None
+        stride = int(stride_arg)
+        return stride if stride > 0 else None
+
+    if not pred_glob.startswith("eval_intrinsic_color_render"):
+        return None
+
+    gt_files = list_gt_images(gt_dir)
+    if len(pred_files) == 0 or len(gt_files) <= len(pred_files):
+        return None
+    if len(gt_files) % len(pred_files) != 0:
+        return None
+    stride = len(gt_files) // len(pred_files)
+    return stride if stride > 1 else None
 
 
 def compute_mean_metrics(all_metrics: List[Dict[str, float]]) -> Dict[str, float]:
@@ -259,7 +332,7 @@ def compute_mean_metrics(all_metrics: List[Dict[str, float]]) -> Dict[str, float
         return {}
     keys = set()
     for m in all_metrics:
-        keys.update(m.keys())
+        keys.update(k for k, v in m.items() if isinstance(v, (int, float)) and np.isfinite(v))
     mean_result: Dict[str, float] = {}
     for k in keys:
         vals = []
@@ -272,19 +345,22 @@ def compute_mean_metrics(all_metrics: List[Dict[str, float]]) -> Dict[str, float
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="评估去除水体的 RGB 图像（PSNR/SSIM/LPIPS）")
-    parser.add_argument("--pred-dir", type=str, required=True, help="预测图像目录")
+    parser.add_argument("--pred-dir", type=str, required=True, help="预测图像目录；也可传 Seafree eval_renders/eval_intrinsic_color_render 前缀")
     parser.add_argument("--gt-dir", type=str, required=True, help="真实/空气图像目录（或该目录下的 images/ColorImage）")
-    parser.add_argument("--pred-glob", type=str, default="*.png", help="预测文件匹配模式（glob），默认 *.png")
+    parser.add_argument("--pred-glob", type=str, default="auto", help="预测文件匹配模式；auto 会优先匹配 Seafree 的 eval_intrinsic_color_render_数字.png，并排除 raw 输出")
+    parser.add_argument("--gt-index-stride", type=str, default="auto",
+                        help="GT 索引步长；auto 对 Seafree eval_intrinsic_color_render_*.png 自动使用 GT数量/预测数量，例如 120/15=8；none 表示仅按文件名匹配")
     parser.add_argument("--align", type=str, default="strict", choices=["strict", "crop", "resize"],
                         help="尺寸不一致时的对齐策略：strict=直接报错；crop=中心裁剪；resize=将预测缩放到GT尺寸")
     parser.add_argument("--output", type=str, default=None, help="输出 JSON 文件路径（默认写入预测目录）")
     args = parser.parse_args()
 
-    pred_dir = Path(args.pred_dir).resolve()
+    pred_input = Path(args.pred_dir).resolve()
+    pred_dir, pred_glob = resolve_pred_input(pred_input, args.pred_glob)
     gt_dir = Path(args.gt_dir).resolve()
 
     if not pred_dir.exists():
-        print(f"[ERROR] 预测目录不存在: {pred_dir}")
+        print(f"[ERROR] 预测目录/前缀不存在: {pred_input}")
         return 1
     if not gt_dir.exists():
         # 允许稍后在 find_matching_gt_file 内部尝试 images/ColorImage 降级
@@ -293,16 +369,20 @@ def main() -> int:
     if args.output:
         output_path = Path(args.output).resolve()
     else:
-        output_path = pred_dir / "eval_rgb_clear_results.json"
+        output_path = default_output_path(pred_dir, pred_glob)
 
-    pred_files = list_pred_images(pred_dir, args.pred_glob)
+    pred_files = list_pred_images(pred_dir, pred_glob)
     if len(pred_files) == 0:
-        print(f"[ERROR] 在 {pred_dir} 下未找到任何匹配 {args.pred_glob} 的图像文件")
+        print(f"[ERROR] 在 {pred_dir} 下未找到任何匹配 {pred_glob} 的图像文件")
         return 1
+    gt_index_stride = infer_gt_index_stride(pred_files, gt_dir, pred_glob, args.gt_index_stride)
 
     print(f"[INFO] 预测目录: {pred_dir}")
+    print(f"[INFO] 预测匹配: {pred_glob}")
     print(f"[INFO] 真值目录: {gt_dir}")
     print(f"[INFO] 待评估图像数: {len(pred_files)}")
+    if gt_index_stride is not None:
+        print(f"[INFO] GT 索引步长: {gt_index_stride}")
 
     per_image_results: Dict[str, Dict[str, float]] = {}
     all_metrics: List[Dict[str, float]] = []
@@ -310,7 +390,8 @@ def main() -> int:
     for i, pred_file in enumerate(pred_files):
         print("\n" + "=" * 80)
         print(f"评估第 {i + 1}/{len(pred_files)} 张: {pred_file.name}")
-        gt_file = find_matching_gt_file(pred_file, gt_dir)
+        gt_index = i * gt_index_stride if gt_index_stride is not None else None
+        gt_file = find_matching_gt_file(pred_file, gt_dir, gt_index=gt_index)
         if gt_file is None:
             print(f"[WARN] 未能在 {gt_dir}（及其可能的 images/ColorImage）为 {pred_file.name} 匹配到 GT 图像")
             per_image_results[pred_file.name] = {"error": "未找到匹配的真值图像"}
@@ -318,6 +399,7 @@ def main() -> int:
 
         try:
             metrics = eval_rgb(str(pred_file), str(gt_file), align=args.align)
+            metrics["gt_file"] = str(gt_file)
             per_image_results[pred_file.name] = metrics
             all_metrics.append(metrics)
             print(f"PSNR: {metrics['psnr']:.4f}, SSIM: {metrics['ssim']:.4f}, LPIPS: {metrics['lpips']:.4f}")
@@ -329,6 +411,11 @@ def main() -> int:
 
     results = {
         "count": len(pred_files),
+        "matched_count": len(all_metrics),
+        "pred_dir": str(pred_dir),
+        "pred_glob": pred_glob,
+        "gt_dir": str(gt_dir),
+        "gt_index_stride": gt_index_stride,
         "per_image": per_image_results,
         "mean": mean_metrics,
     }
@@ -348,5 +435,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 r"""
 将 Z:\AAAAA_UE 下的 EXR 深度图批量转换为 PNG，并把输出写入一个你指定的输出根目录，
-保持与输入根目录完全一致的相对路径结构。顶层名为 test 的目录会被跳过。
+保持与输入根目录完全一致的相对路径结构。兼容 SeaFree-GS 的 depth_exr/test 输出。
 输出路径的最后一级目录名强制为 DepthImage。
 
 默认参数对齐单文件可视化脚本：
@@ -25,11 +25,14 @@ import numpy as np
 import os
 import time
 
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 # 读取 EXR 依赖
 try:
     import OpenEXR, Imath
 except Exception:
-    raise RuntimeError("需要 openexr 与 imath，pip install openexr imath")
+    OpenEXR = None
+    Imath = None
 
 # 写 PNG 依赖
 _USE_IMAGEIO = True
@@ -62,6 +65,18 @@ def _pick_depth_channel(header, preferred="R") -> str:
     return chans[0]
 
 def read_exr_depth(path: Path, channel_hint: str = "R") -> np.ndarray:
+    if OpenEXR is None:
+        if not _HAS_CV2:
+            raise RuntimeError("需要 OpenEXR/Imath 或 OpenCV EXR 支持来读取 EXR")
+        arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            raise RuntimeError(f"OpenCV 读取 EXR 失败: {path}")
+        if arr.ndim == 3:
+            requested = channel_hint.lower()
+            channel_map = {"b": 0, "g": 1, "r": 2, "z": 0, "depth": 0}
+            arr = arr[..., channel_map.get(requested, 0)]
+        return np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
     f = OpenEXR.InputFile(str(path))
     header = f.header()
     dw = header["dataWindow"]
@@ -223,6 +238,7 @@ def main():
     ap.add_argument("--keep-linear", action="store_true", help="保持线性，不做 γ 校正")
     # 断点续转与覆盖策略
     ap.add_argument("--overwrite", action="store_true", help="强制重写已存在 PNG，不做断点续转")
+    ap.add_argument("--skip-test-dir", action="store_true", help="跳过输入根目录下名为 test 的一级子目录（保留旧数据集行为）")
     ap.add_argument("--dry-run", action="store_true", help="仅打印计划，不实际写文件")
     args = ap.parse_args()
 
@@ -239,7 +255,7 @@ def main():
     total, done, skipped = 0, 0, 0
 
     for scene in sorted(scenes):
-        if scene.name.lower() == "test":
+        if args.skip_test_dir and scene != in_root and scene.name.lower() == "test":
             print(f"[跳过] {scene}")
             continue
 

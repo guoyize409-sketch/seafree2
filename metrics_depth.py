@@ -24,9 +24,19 @@ from argparse import ArgumentParser
 import numpy as np
 import re
 
-# EXR single-channel reader (depth)
-import OpenEXR
-import Imath
+# EXR single-channel reader (depth). Prefer OpenEXR when available, but allow
+# the seafree-gs env to evaluate with OpenCV-only EXR support.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+try:
+    import OpenEXR
+    import Imath
+except Exception:
+    OpenEXR = None
+    Imath = None
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 def readImages(renders_dir: Path, gt_dir: Path):
     
@@ -45,6 +55,17 @@ def readImages(renders_dir: Path, gt_dir: Path):
 def read_exr_channel(file_path: str, channel_name: str = "R") -> np.ndarray:
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
+    if OpenEXR is None:
+        if cv2 is None:
+            raise RuntimeError("OpenEXR is unavailable and cv2 fallback is not installed.")
+        arr = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            raise RuntimeError(f"Failed to read EXR with cv2: {file_path}")
+        if arr.ndim == 3:
+            requested = (channel_name or "").lower()
+            channel_map = {"b": 0, "g": 1, "r": 2, "z": 0, "depth": 0}
+            arr = arr[..., channel_map.get(requested, 0)]
+        return np.asarray(arr, dtype=np.float32)
     exr_file = OpenEXR.InputFile(file_path)
     try:
         header = exr_file.header()
@@ -162,6 +183,7 @@ def _resolve_gt_depth_dir(source_path: str) -> Path:
 
 def _candidate_pred_depth_dirs(scene_dir: Path, method_dir: Path):
     return [
+        method_dir / "depth_exr" / "test",
         method_dir / "depth_exr",
         method_dir / "renders_depth_exr",
         method_dir / "depth_exr_custom",
