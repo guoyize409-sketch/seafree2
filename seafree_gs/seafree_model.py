@@ -24,6 +24,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import cv2
 import numpy as np
@@ -208,6 +209,62 @@ class SeaFreeGsModelConfig(ModelConfig):
     """Sigmoid sharpness for texture-based water probability."""
     water_transition_intrinsic_texture_quantile: float = 0.25
     """Intrinsic-render gradient quantile below which transition water remains texture-poor."""
+    enable_intrinsic_scene_rescue: bool = True
+    """Use raw intrinsic appearance as counter-evidence before suppressing water/null regions."""
+    intrinsic_rescue_luma_threshold: float = 0.035
+    """Minimum raw intrinsic luminance required before color evidence can rescue a region."""
+    intrinsic_rescue_texture_quantile: float = 0.65
+    """Raw intrinsic gradient quantile above which local structure becomes scene evidence."""
+    intrinsic_rescue_color_sigma: float = 0.18
+    """Color-distance scale for raw intrinsic vs. water-background scene evidence."""
+    intrinsic_rescue_alpha_threshold: float = 0.20
+    """Gaussian alpha threshold used as supporting evidence for weak intrinsic scene structure."""
+    intrinsic_rescue_pure_strength: float = 0.85
+    """How strongly scene evidence suppresses pure-water probability."""
+    intrinsic_rescue_transition_strength: float = 0.95
+    """How strongly scene evidence suppresses transition-water probability."""
+    intrinsic_visibility_rescue_strength: float = 0.90
+    """How strongly scene evidence protects the final intrinsic visibility gate."""
+    intrinsic_visibility_floor: float = 0.35
+    """Minimum visibility retained when raw intrinsic scene evidence is strong."""
+    intrinsic_rescue_structure_strength: float = 0.35
+    """Maximum amount by which texture/depth structure can amplify appearance-backed scene rescue."""
+    intrinsic_rescue_blue_suppression: float = 0.90
+    """Suppress scene rescue in raw-intrinsic blue-water chroma regions."""
+    intrinsic_water_blue_margin: float = 0.035
+    """Blue-channel excess above max(red, green) that indicates residual water color."""
+    intrinsic_water_blue_scale: float = 0.035
+    """Softness of the raw-intrinsic blue-water chroma detector."""
+    intrinsic_water_red_deficit_margin: float = 0.030
+    """Red-channel deficit below green/blue that indicates cyan water residuals."""
+    intrinsic_water_red_deficit_scale: float = 0.040
+    """Softness of the raw-intrinsic cyan / red-deficit water detector."""
+    residual_water_strength: float = 1.00
+    """Strength with which residual blue-water evidence contributes to null probability."""
+    residual_water_visibility_strength: float = 1.00
+    """Strength with which residual blue-water evidence suppresses final intrinsic visibility."""
+    residual_water_visibility_gamma: float = 1.80
+    """Nonlinear visibility hardening for residual water; >1 makes medium-confidence water darker."""
+    residual_water_scene_suppression: float = 0.90
+    """How strongly residual blue-water evidence cancels scene rescue in visibility."""
+    residual_water_depth_floor: float = 0.65
+    """Minimum depth-context confidence retained for raw-intrinsic residual water evidence."""
+    residual_water_similarity_floor: float = 0.55
+    """Minimum water-color similarity retained for raw-intrinsic residual water evidence."""
+    residual_water_scene_guard_floor: float = 0.50
+    """Minimum residual-water confidence retained even when scene rescue is non-zero."""
+    residual_water_chroma_loss_weight: float = 0.01
+    """Penalty weight for blue-channel residuals in raw intrinsic water-color regions."""
+    enable_connected_freewater_prior: bool = True
+    """Use soft border-connected water evidence to suppress free-water sheets and bands."""
+    connected_freewater_iterations: int = 24
+    """Number of 3x3 soft dilation steps for the border-connected freewater prior."""
+    connected_freewater_strength: float = 0.85
+    """Strength with which connected freewater evidence contributes to null probability."""
+    connected_freewater_visibility_strength: float = 1.00
+    """Strength with which connected freewater evidence suppresses final intrinsic visibility."""
+    connected_freewater_visibility_gamma: float = 1.40
+    """Nonlinear visibility hardening for border-connected freewater sheets."""
     water_null_ambient_color_sigma: float = 0.10
     """Color-distance scale for matching pure-water pixels to WPP ambient light."""
     water_transition_ambient_color_sigma: float = 0.16
@@ -244,14 +301,18 @@ class SeaFreeGsModelConfig(ModelConfig):
     """Allowed residual Gaussian alpha in transition water before alpha loss is applied."""
     water_empty_loss_weight: float = 0.08
     """Penalty weight for Gaussian accumulation on pure-water rays."""
-    water_transition_alpha_loss_weight: float = 0.04
-    """Penalty weight for keeping transition-water alpha below its low target."""
+    water_transition_alpha_loss_weight: float = 0.0
+    """Penalty weight for keeping transition-water alpha below its low target. Kept off by default because transition masks are intentionally soft."""
     water_intrinsic_null_loss_weight: float = 0.02
     """Penalty weight for non-black intrinsic radiance on pure-water rays."""
     water_background_ownership_loss_weight: float = 0.02
     """Penalty weight that makes WPP, not scene Gaussians, explain pure-water observations."""
     water_lifecycle_ema: float = 0.96
     """EMA factor for per-Gaussian water/scene exposure scores."""
+    enable_water_lifecycle_growth_suppression: bool = False
+    """Allow water-dominated Gaussians to be blocked from densification. Disabled by default to avoid suppressing weak distant objects."""
+    enable_water_lifecycle_pruning: bool = False
+    """Allow water-dominated Gaussians to be pruned. Disabled by default because false positives permanently remove scene detail."""
     water_growth_suppress_start_step: int = 6000
     """Start suppressing densification gradients for water-dominated Gaussians."""
     water_growth_suppress_threshold: float = 0.75
@@ -436,6 +497,8 @@ class SeaFreeGsModel(Model):
         self.last_water_transition_probability_mean = torch.tensor(0.0)
         self.last_water_strict_probability_mean = torch.tensor(0.0)
         self.last_water_horizon_probability_mean = torch.tensor(0.0)
+        self.last_residual_water_probability_mean = torch.tensor(0.0)
+        self.last_connected_freewater_probability_mean = torch.tensor(0.0)
         self.last_water_no_grow_candidates = 0
         self.last_water_prune_candidates = 0
 
@@ -510,15 +573,21 @@ class SeaFreeGsModel(Model):
     def step_post_backward(self, step):
         assert step == self.step
         if self.config.enable_water_null_occupancy:
-            self._suppress_water_dominated_growth()
-            water_no_grow_mask = self._get_water_lifecycle_no_grow_mask()
-            if hasattr(self.strategy, "set_external_no_grow_mask"):
-                self.strategy.set_external_no_grow_mask(water_no_grow_mask)
-            self.last_water_no_grow_candidates = int(water_no_grow_mask.sum().item()) if water_no_grow_mask is not None else 0
-            water_prune_mask = self._get_water_lifecycle_prune_mask()
-            if hasattr(self.strategy, "set_external_prune_mask"):
-                self.strategy.set_external_prune_mask(water_prune_mask)
-            self.last_water_prune_candidates = int(water_prune_mask.sum().item()) if water_prune_mask is not None else 0
+            if self.config.enable_water_lifecycle_growth_suppression:
+                self._suppress_water_dominated_growth()
+                water_no_grow_mask = self._get_water_lifecycle_no_grow_mask()
+                if hasattr(self.strategy, "set_external_no_grow_mask"):
+                    self.strategy.set_external_no_grow_mask(water_no_grow_mask)
+                self.last_water_no_grow_candidates = int(water_no_grow_mask.sum().item()) if water_no_grow_mask is not None else 0
+            else:
+                self.last_water_no_grow_candidates = 0
+            if self.config.enable_water_lifecycle_pruning:
+                water_prune_mask = self._get_water_lifecycle_prune_mask()
+                if hasattr(self.strategy, "set_external_prune_mask"):
+                    self.strategy.set_external_prune_mask(water_prune_mask)
+                self.last_water_prune_candidates = int(water_prune_mask.sum().item()) if water_prune_mask is not None else 0
+            else:
+                self.last_water_prune_candidates = 0
         n_before_refine = self.num_points
         self.strategy.step_post_backward(
             params=self.gauss_params,
@@ -614,6 +683,143 @@ class SeaFreeGsModel(Model):
         dy[1:, :, :] = torch.abs(gray[1:, :, :] - gray[:-1, :, :])
         return dx + dy
 
+    def _intrinsic_blue_water_chroma(self, intrinsic_image: Optional[torch.Tensor]) -> torch.Tensor:
+        """Detect visible blue/cyan residual water color in the raw intrinsic render."""
+        if intrinsic_image is None or intrinsic_image.numel() == 0:
+            raise ValueError("intrinsic_image is required to infer the output shape")
+        intrinsic = torch.nan_to_num(
+            intrinsic_image[..., :3].detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        red_or_green = torch.maximum(intrinsic[..., 0:1], intrinsic[..., 1:2])
+        blue = intrinsic[..., 2:3]
+        blue_excess = blue - red_or_green
+        blue_margin = self.config.intrinsic_water_blue_margin
+        blue_scale = max(self.config.intrinsic_water_blue_scale, 1e-4)
+        blue_chroma = torch.sigmoid((blue_excess - blue_margin) / blue_scale * 4.0)
+        red_deficit = torch.minimum(intrinsic[..., 1:2], blue) - intrinsic[..., 0:1]
+        red_deficit_margin = self.config.intrinsic_water_red_deficit_margin
+        red_deficit_scale = max(self.config.intrinsic_water_red_deficit_scale, 1e-4)
+        cyan_chroma = torch.sigmoid(
+            (red_deficit - red_deficit_margin) / red_deficit_scale * 4.0
+        )
+
+        luma = intrinsic.mean(dim=-1, keepdim=True)
+        luma_threshold = max(self.config.intrinsic_rescue_luma_threshold, 1e-4)
+        visible_luma = torch.sigmoid((luma - luma_threshold) / luma_threshold * 4.0)
+        return (torch.maximum(blue_chroma, 0.75 * cyan_chroma) * visible_luma).detach().clamp(0.0, 1.0)
+
+    def _build_connected_freewater_prior(
+        self,
+        seed: torch.Tensor,
+        support: torch.Tensor,
+    ) -> torch.Tensor:
+        """Softly propagate water evidence from image borders through water-like support."""
+        if not self.config.enable_connected_freewater_prior or seed.numel() == 0:
+            return torch.zeros_like(seed)
+
+        seed_2d = seed.detach().squeeze(-1).clamp(0.0, 1.0)
+        support_2d = support.detach().squeeze(-1).clamp(0.0, 1.0)
+        border = torch.zeros_like(seed_2d)
+        border[0, :] = seed_2d[0, :]
+        border[-1, :] = torch.maximum(border[-1, :], seed_2d[-1, :])
+        border[:, 0] = torch.maximum(border[:, 0], seed_2d[:, 0])
+        border[:, -1] = torch.maximum(border[:, -1], seed_2d[:, -1])
+
+        connected = border[None, None, ...]
+        support_chw = support_2d[None, None, ...]
+        for _ in range(max(0, int(self.config.connected_freewater_iterations))):
+            expanded = F.max_pool2d(connected, kernel_size=3, stride=1, padding=1)
+            connected = torch.maximum(connected, expanded * support_chw)
+        return connected.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
+
+    def _build_intrinsic_scene_rescue(
+        self,
+        intrinsic_image: Optional[torch.Tensor],
+        water_background_image: torch.Tensor,
+        intrinsic_texture: Optional[torch.Tensor] = None,
+        depth_edge_support: Optional[torch.Tensor] = None,
+        accumulation: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Build raw-intrinsic counter-evidence that a blue / distant region is still real scene content."""
+        reference = water_background_image[..., :1]
+        if (
+            not self.config.enable_intrinsic_scene_rescue
+            or intrinsic_image is None
+            or intrinsic_image.numel() == 0
+        ):
+            return torch.zeros_like(reference)
+
+        intrinsic = torch.nan_to_num(
+            intrinsic_image[..., :3].detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        intrinsic_luma = intrinsic.mean(dim=-1, keepdim=True)
+        luma_threshold = max(self.config.intrinsic_rescue_luma_threshold, 1e-4)
+        luma_evidence = torch.sigmoid((intrinsic_luma - luma_threshold) / luma_threshold * 6.0)
+
+        if intrinsic_texture is None:
+            intrinsic_texture = self._image_gradient_magnitude(intrinsic).detach()
+        texture_cut = torch.quantile(
+            intrinsic_texture.flatten(),
+            min(max(self.config.intrinsic_rescue_texture_quantile, 0.0), 1.0),
+        ).detach().clamp_min(1e-5)
+        texture_evidence = torch.sigmoid(
+            (intrinsic_texture - texture_cut)
+            / texture_cut
+            * self.config.water_null_texture_sharpness
+        )
+
+        intrinsic_ambient_distance = torch.abs(
+            intrinsic - water_background_image[..., :3].detach()
+        ).mean(dim=-1, keepdim=True)
+        color_residual_evidence = 1.0 - torch.exp(
+            -intrinsic_ambient_distance / max(self.config.intrinsic_rescue_color_sigma, 1e-4)
+        )
+
+        # A simple non-blue / non-free-water chroma cue. It is only allowed to
+        # rescue visible intrinsic content, so near-black pure water does not
+        # become scene evidence just because it differs from the blue ambient.
+        red_or_green = torch.maximum(intrinsic[..., 0:1], intrinsic[..., 1:2])
+        blue = intrinsic[..., 2:3]
+        non_blue_evidence = torch.sigmoid((red_or_green - 0.85 * blue) / 0.05)
+        appearance_evidence = luma_evidence * torch.maximum(color_residual_evidence, non_blue_evidence)
+        blue_water_chroma = self._intrinsic_blue_water_chroma(intrinsic)
+        appearance_evidence = appearance_evidence * (
+            1.0 - self.config.intrinsic_rescue_blue_suppression * blue_water_chroma
+        ).clamp(0.0, 1.0)
+
+        if depth_edge_support is None:
+            depth_edge_support = torch.zeros_like(reference)
+        geometry_evidence = depth_edge_support.detach().clamp(0.0, 1.0)
+
+        structure_evidence = torch.maximum(texture_evidence, geometry_evidence)
+        structure_strength = max(min(self.config.intrinsic_rescue_structure_strength, 1.0), 0.0)
+        rescue = appearance_evidence * (1.0 + structure_strength * structure_evidence)
+
+        if accumulation is not None:
+            alpha = torch.nan_to_num(
+                accumulation[..., :1].detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            alpha_threshold = max(self.config.intrinsic_rescue_alpha_threshold, 1e-4)
+            alpha_evidence = torch.sigmoid((alpha - alpha_threshold) / alpha_threshold * 6.0)
+            rescue = rescue * (0.35 + 0.65 * alpha_evidence)
+
+        # Expand only appearance-backed scene evidence by one pixel. This keeps
+        # fragile object boundaries, while blue water streaks / depth-edge
+        # artifacts cannot be rescued by structure alone.
+        rescue_chw = rescue.permute(2, 0, 1).unsqueeze(0)
+        rescue_dilated = F.max_pool2d(rescue_chw, kernel_size=3, stride=1, padding=1)
+        rescue = torch.maximum(rescue, 0.45 * rescue_dilated.squeeze(0).permute(1, 2, 0))
+        return rescue.detach().clamp(0.0, 1.0)
+
     def _build_horizon_prior(
         self,
         base_transition: torch.Tensor,
@@ -649,6 +855,7 @@ class SeaFreeGsModel(Model):
         gt_underwater_image: torch.Tensor,
         water_background_image: torch.Tensor,
         intrinsic_image: Optional[torch.Tensor] = None,
+        accumulation: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Estimate AquaNull-v2 pure, transition, and combined null-space probabilities.
 
@@ -669,6 +876,9 @@ class SeaFreeGsModel(Model):
                 "horizon": zero,
                 "depth_edge_support": zero,
                 "color_residual_support": zero,
+                "scene_rescue": zero,
+                "residual_water": zero,
+                "connected_freewater": zero,
             }
 
         static_cut = torch.tensor(
@@ -718,6 +928,7 @@ class SeaFreeGsModel(Model):
                 * self.config.water_null_texture_sharpness
             )
         else:
+            intrinsic_texture = None
             intrinsic_texture_confidence = torch.ones_like(texture_confidence)
 
         ambient_distance = torch.abs(
@@ -757,10 +968,21 @@ class SeaFreeGsModel(Model):
             * self.config.water_depth_edge_sharpness
         ).detach().clamp(0.0, 1.0)
         color_residual_support = (ambient_distance / max(self.config.water_transition_ambient_color_sigma, 1e-4)).detach().clamp(0.0, 1.0)
+        scene_rescue = self._build_intrinsic_scene_rescue(
+            intrinsic_image,
+            water_background_image,
+            intrinsic_texture,
+            depth_edge_support,
+            accumulation,
+        )
 
-        pure_probability = depth_confidence * texture_confidence
-        pure_probability = pure_probability * (ambient_confidence * ambient_confidence)
-        pure_probability = pure_probability * edge_protection
+        pure_base = depth_confidence * texture_confidence
+        pure_base = pure_base * (ambient_confidence * ambient_confidence)
+        pure_base = pure_base * edge_protection
+        pure_probability = pure_base
+        pure_probability = pure_probability * (
+            1.0 - self.config.intrinsic_rescue_pure_strength * scene_rescue
+        ).clamp(0.0, 1.0)
 
         transition_base = transition_depth_confidence * texture_confidence
         transition_base = transition_base * intrinsic_texture_confidence
@@ -772,7 +994,75 @@ class SeaFreeGsModel(Model):
             transition_base,
             horizon_prior * transition_depth_confidence * low_depth_edge_confidence,
         )
+        transition_probability = transition_probability * (
+            1.0 - self.config.intrinsic_rescue_transition_strength * scene_rescue
+        ).clamp(0.0, 1.0)
+
+        if intrinsic_image is not None:
+            intrinsic_blue_water = self._intrinsic_blue_water_chroma(intrinsic_image)
+            intrinsic = torch.nan_to_num(
+                intrinsic_image[..., :3].detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            intrinsic_ambient_distance = torch.abs(
+                intrinsic - water_background_image[..., :3].detach()
+            ).mean(dim=-1, keepdim=True)
+            intrinsic_water_similarity = torch.exp(
+                -intrinsic_ambient_distance / max(self.config.intrinsic_rescue_color_sigma, 1e-4)
+            )
+        else:
+            intrinsic_blue_water = torch.zeros_like(depth)
+            intrinsic_water_similarity = torch.zeros_like(depth)
+
+        # Residual water is blue/cyan haze that survives in raw intrinsic. It is
+        # not the same as pure water: suppress water color first, without
+        # treating all structure as true scene.
+        residual_scene_guard_floor = max(
+            min(self.config.residual_water_scene_guard_floor, 1.0),
+            0.0,
+        )
+        residual_scene_guard = (
+            1.0 - 0.50 * self.config.residual_water_scene_suppression * scene_rescue
+        ).clamp(residual_scene_guard_floor, 1.0)
+        residual_depth_floor = max(min(self.config.residual_water_depth_floor, 1.0), 0.0)
+        residual_similarity_floor = max(min(self.config.residual_water_similarity_floor, 1.0), 0.0)
+        residual_depth_context = residual_depth_floor + (
+            1.0 - residual_depth_floor
+        ) * transition_depth_confidence
+        residual_similarity_context = residual_similarity_floor + (
+            1.0 - residual_similarity_floor
+        ) * intrinsic_water_similarity
+        residual_water_probability = intrinsic_blue_water
+        residual_water_probability = residual_water_probability * residual_depth_context
+        residual_water_probability = residual_water_probability * residual_similarity_context
+        residual_water_probability = residual_water_probability * residual_scene_guard
+        residual_water_probability = torch.maximum(
+            residual_water_probability,
+            intrinsic_blue_water * torch.maximum(pure_base, transition_probability).detach(),
+        )
+        residual_water_probability = residual_water_probability.detach().clamp(0.0, 1.0)
+
+        connected_seed = torch.maximum(pure_base.detach(), residual_water_probability)
+        connected_support = torch.maximum(transition_base.detach(), residual_water_probability)
+        connected_support = connected_support * (
+            1.0 - 0.50 * scene_rescue
+        ).clamp(0.15, 1.0)
+        connected_freewater = self._build_connected_freewater_prior(
+            connected_seed.clamp(0.0, 1.0),
+            connected_support.clamp(0.0, 1.0),
+        )
+
         null_probability = torch.maximum(pure_probability, transition_probability)
+        null_probability = torch.maximum(
+            null_probability,
+            residual_water_probability * self.config.residual_water_strength,
+        )
+        null_probability = torch.maximum(
+            null_probability,
+            connected_freewater * self.config.connected_freewater_strength,
+        )
 
         return {
             "pure": pure_probability.detach().clamp(0.0, 1.0),
@@ -781,6 +1071,9 @@ class SeaFreeGsModel(Model):
             "horizon": horizon_prior.detach().clamp(0.0, 1.0),
             "depth_edge_support": depth_edge_support,
             "color_residual_support": color_residual_support,
+            "scene_rescue": scene_rescue,
+            "residual_water": residual_water_probability,
+            "connected_freewater": connected_freewater.detach().clamp(0.0, 1.0),
         }
 
     def _build_water_null_probability(
@@ -789,6 +1082,7 @@ class SeaFreeGsModel(Model):
         gt_underwater_image: torch.Tensor,
         water_background_image: torch.Tensor,
         intrinsic_image: Optional[torch.Tensor] = None,
+        accumulation: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compatibility wrapper returning the combined AquaNull-v2 null probability."""
         return self._build_water_null_probabilities(
@@ -796,6 +1090,7 @@ class SeaFreeGsModel(Model):
             gt_underwater_image,
             water_background_image,
             intrinsic_image,
+            accumulation,
         )["null"]
 
     def _build_strict_water_null_probability(
@@ -830,6 +1125,46 @@ class SeaFreeGsModel(Model):
             )
 
         return strict_probability.detach().clamp(0.0, 1.0)
+
+    def _build_depth_foreground_mask(
+        self,
+        pseudo_depth: torch.Tensor,
+        image_idx,
+    ) -> Tuple[torch.Tensor, float]:
+        """Original SeaFree-GS foreground mask from pseudo-depth contours."""
+        downscale = self._get_downscale_factor()
+        if image_idx in self.foreground_mask_cache.keys() and downscale in self.foreground_mask_cache[image_idx].keys():
+            cached = self.foreground_mask_cache[image_idx][downscale]
+            return cached["mask_tensor"], cached["background_pixel_ratio"]
+
+        background_depth_threshold = 1e-2
+        pseudo_depth_numpy = pseudo_depth.squeeze().detach().cpu().numpy()
+        mask_1e_2_copy = (pseudo_depth_numpy < background_depth_threshold).astype(np.uint8) * 255
+        _, binary_image = cv2.threshold(mask_1e_2_copy, 127, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        foreground_mask_array = np.zeros_like(binary_image)
+        if len(contours) > 0:
+            max_contour = max(contours, key=cv2.contourArea)
+            cv2.drawContours(foreground_mask_array, [max_contour], -1, (255,), thickness=cv2.FILLED)
+        foreground_mask_array = foreground_mask_array.astype(np.float32) / 255
+        foreground_mask_array[foreground_mask_array < background_depth_threshold] = 0
+        foreground_mask_array[foreground_mask_array > 0] = 1
+
+        foreground_mask = torch.from_numpy(foreground_mask_array).float()
+        foreground_mask = foreground_mask.to(device=pseudo_depth.device, dtype=pseudo_depth.dtype)
+        foreground_mask.unsqueeze_(-1)
+
+        total_pixels = foreground_mask_array.size
+        background_pixels = foreground_mask_array[foreground_mask_array < 0.5]
+        background_pixel_ratio = background_pixels.size / total_pixels
+
+        if image_idx not in self.foreground_mask_cache.keys():
+            self.foreground_mask_cache[image_idx] = {}
+        self.foreground_mask_cache[image_idx][downscale] = {
+            "mask_tensor": foreground_mask,
+            "background_pixel_ratio": background_pixel_ratio,
+        }
+        return foreground_mask, background_pixel_ratio
 
     def _ensure_water_lifecycle_buffers(self):
         """Keep per-Gaussian water/scene exposure buffers aligned with current params."""
@@ -1027,6 +1362,7 @@ class SeaFreeGsModel(Model):
         if (
             not self.training
             or not self.config.enable_water_null_occupancy
+            or not self.config.enable_water_lifecycle_growth_suppression
             or self.step < self.config.water_growth_suppress_start_step
             or self.step % self.config.refine_every != 0
         ):
@@ -1041,6 +1377,7 @@ class SeaFreeGsModel(Model):
         if (
             not self.training
             or not self.config.enable_water_null_occupancy
+            or not self.config.enable_water_lifecycle_growth_suppression
             or self.step < self.config.water_growth_suppress_start_step
             or not hasattr(self, "info")
             or self.info is None
@@ -1066,6 +1403,7 @@ class SeaFreeGsModel(Model):
         if (
             not self.training
             or not self.config.enable_water_null_occupancy
+            or not self.config.enable_water_lifecycle_pruning
             or self.step < self.config.water_prune_start_step
             or self.step % self.config.refine_every != 0
         ):
@@ -1112,18 +1450,89 @@ class SeaFreeGsModel(Model):
         consistency_guard = (0.25 + 0.75 * consistency_score).clamp(0.0, 1.0)
         return (null_ratio * edge_guard * residual_guard * consistency_guard).clamp(0.0, 1.0).unsqueeze(-1)
 
-    @staticmethod
     def _build_intrinsic_visibility_gate(
+        self,
         alpha: torch.Tensor,
         water_probability: Optional[torch.Tensor] = None,
         alpha_water: Optional[torch.Tensor] = None,
+        scene_rescue: Optional[torch.Tensor] = None,
+        residual_water: Optional[torch.Tensor] = None,
+        connected_freewater: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Scene visibility gate shared by intrinsic rendering and null-space losses."""
         if water_probability is None:
             water_probability = torch.zeros_like(alpha)
         if alpha_water is None:
             alpha_water = torch.zeros_like(alpha)
-        return ((alpha - alpha_water) * (1.0 - water_probability)).clamp(0.0, 1.0)
+        if scene_rescue is None:
+            scene_rescue = torch.zeros_like(alpha)
+        if residual_water is None:
+            residual_water = torch.zeros_like(alpha)
+        if connected_freewater is None:
+            connected_freewater = torch.zeros_like(alpha)
+
+        water_probability = torch.nan_to_num(
+            water_probability.detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        alpha = torch.nan_to_num(alpha.detach(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        alpha_water = torch.nan_to_num(
+            alpha_water.detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        scene_rescue = torch.nan_to_num(
+            scene_rescue.detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        residual_water = torch.nan_to_num(
+            residual_water.detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        connected_freewater = torch.nan_to_num(
+            connected_freewater.detach(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+
+        water_alpha_ratio = (alpha_water / alpha.clamp_min(1e-6)).clamp(0.0, 1.0)
+        water_strength = torch.maximum(water_probability, water_alpha_ratio)
+        residual_visibility = 1.0 - torch.pow(
+            (1.0 - residual_water).clamp(0.0, 1.0),
+            max(self.config.residual_water_visibility_gamma, 1e-4),
+        )
+        connected_visibility = 1.0 - torch.pow(
+            (1.0 - connected_freewater).clamp(0.0, 1.0),
+            max(self.config.connected_freewater_visibility_gamma, 1e-4),
+        )
+        water_strength = torch.maximum(
+            water_strength,
+            residual_visibility * max(min(self.config.residual_water_visibility_strength, 1.0), 0.0),
+        )
+        water_strength = torch.maximum(
+            water_strength,
+            connected_visibility * max(min(self.config.connected_freewater_visibility_strength, 1.0), 0.0),
+        )
+        freewater_rescue_cancel = torch.maximum(
+            residual_water,
+            connected_freewater * 0.75,
+        )
+        scene_rescue_safe = scene_rescue * (
+            1.0 - self.config.residual_water_scene_suppression * freewater_rescue_cancel
+        ).clamp(0.0, 1.0)
+        rescue_strength = max(min(self.config.intrinsic_visibility_rescue_strength, 1.0), 0.0)
+        visibility = 1.0 - water_strength * (1.0 - rescue_strength * scene_rescue_safe)
+        visibility_floor = max(min(self.config.intrinsic_visibility_floor, 1.0), 0.0) * scene_rescue_safe
+        visibility = torch.maximum(visibility, visibility_floor)
+        return visibility.clamp(0.0, 1.0)
 
     @staticmethod
     def get_empty_outputs(width: int, height: int, background: torch.Tensor) -> Dict[str, Union[torch.Tensor, List]]:
@@ -1454,6 +1863,8 @@ class SeaFreeGsModel(Model):
             metrics_dict["water_transition_probability_mean"] = self.last_water_transition_probability_mean.to(self.device)
             metrics_dict["water_null_strict_probability_mean"] = self.last_water_strict_probability_mean.to(self.device)
             metrics_dict["water_horizon_probability_mean"] = self.last_water_horizon_probability_mean.to(self.device)
+            metrics_dict["residual_water_probability_mean"] = self.last_residual_water_probability_mean.to(self.device)
+            metrics_dict["connected_freewater_probability_mean"] = self.last_connected_freewater_probability_mean.to(self.device)
             metrics_dict["water_exposure_score_mean"] = self.strategy_state["water_exposure_score"].mean()
             metrics_dict["scene_exposure_score_mean"] = self.strategy_state["scene_exposure_score"].mean()
             metrics_dict["depth_edge_support_score_mean"] = self.strategy_state["depth_edge_support_score"].mean()
@@ -1537,13 +1948,18 @@ class SeaFreeGsModel(Model):
         strict_water_null_probability = None
         strict_pure_water_probability = None
         strict_transition_water_probability = None
-        intrinsic_clean = outputs.get("intrinsic_color_render", outputs.get("intrinsic_color_render_raw"))
+        strict_destructive_water_probability = None
+        foreground_mask, background_pixel_ratio = self._build_depth_foreground_mask(
+            pseudo_depth,
+            batch["image_idx"],
+        )
         if self.config.enable_water_null_occupancy:
             water_probabilities = self._build_water_null_probabilities(
                 pseudo_depth,
                 gt_underwater_image,
                 outputs["water_background_image"],
                 outputs.get("intrinsic_color_render_raw", outputs["intrinsic_color_render"]),
+                outputs["accumulation"],
             )
             water_pure_probability = water_probabilities["pure"]
             water_transition_probability = water_probabilities["transition"]
@@ -1559,66 +1975,19 @@ class SeaFreeGsModel(Model):
                 self.config.water_transition_max_fraction,
             )
             strict_water_null_probability = torch.maximum(strict_pure_water_probability, strict_transition_water_probability)
-            alpha_water = torch.maximum(
-                outputs.get("water_accumulation", torch.zeros_like(outputs["accumulation"])),
-                outputs["accumulation"].detach() * strict_water_null_probability,
-            )
-            intrinsic_visibility = self._build_intrinsic_visibility_gate(
-                outputs["accumulation"],
-                water_null_probability,
-                alpha_water,
-            )
-            intrinsic_clean = outputs.get("intrinsic_color_render_raw", outputs["intrinsic_color_render"]) * intrinsic_visibility
-            foreground_mask = (water_null_probability < self.config.water_null_binary_threshold).to(
-                device=pseudo_depth.device,
-                dtype=pseudo_depth.dtype,
-            )
-            background_pixel_ratio = float((strict_water_null_probability > 0).float().mean().detach().cpu())
+            strict_destructive_water_probability = strict_pure_water_probability
             self.last_water_probability_mean = water_null_probability.mean().detach()
             self.last_water_pure_probability_mean = water_pure_probability.mean().detach()
             self.last_water_transition_probability_mean = water_transition_probability.mean().detach()
             self.last_water_strict_probability_mean = strict_water_null_probability.mean().detach()
             self.last_water_horizon_probability_mean = water_probabilities["horizon"].mean().detach()
+            self.last_residual_water_probability_mean = water_probabilities["residual_water"].mean().detach()
+            self.last_connected_freewater_probability_mean = water_probabilities["connected_freewater"].mean().detach()
             self._update_water_lifecycle_scores(
-                strict_water_null_probability,
+                strict_destructive_water_probability,
                 water_probabilities["depth_edge_support"],
                 water_probabilities["color_residual_support"],
             )
-        else:
-            # Build the foreground mask from the pseudo-depth map.
-            image_idx = batch['image_idx']
-            if image_idx in self.foreground_mask_cache.keys() and self._get_downscale_factor() in self.foreground_mask_cache[image_idx].keys():
-                foreground_mask = self.foreground_mask_cache[image_idx][self._get_downscale_factor()]['mask_tensor']
-                background_pixel_ratio = self.foreground_mask_cache[image_idx][self._get_downscale_factor()]['background_pixel_ratio']
-
-            else:
-                background_depth_threshold = 1e-2
-                pseudo_depth_numpy = pseudo_depth.squeeze().cpu().numpy()
-                mask_1e_2_copy = (pseudo_depth_numpy < background_depth_threshold).astype(np.uint8) * 255
-                _, binary_image = cv2.threshold(mask_1e_2_copy, 127, 255, cv2.THRESH_BINARY_INV)
-                contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                foreground_mask_array = np.zeros_like(binary_image)
-                if len(contours) > 0:
-                    max_contour = max(contours, key=cv2.contourArea)
-                    cv2.drawContours(foreground_mask_array, [max_contour], -1, (255,), thickness=cv2.FILLED)
-                foreground_mask_array = foreground_mask_array.astype(np.float32) / 255
-                foreground_mask_array[foreground_mask_array < background_depth_threshold] = 0
-                foreground_mask_array[foreground_mask_array > 0] = 1
-
-                foreground_mask = torch.from_numpy(foreground_mask_array).float()
-                foreground_mask = foreground_mask.to(device=pseudo_depth.device, dtype=pseudo_depth.dtype)
-                foreground_mask.unsqueeze_(-1)
-
-                total_pixels = foreground_mask_array.size
-                background_pixels = foreground_mask_array[foreground_mask_array < 0.5]
-                background_pixel_ratio = background_pixels.size / total_pixels
-
-                if image_idx not in self.foreground_mask_cache.keys():
-                    self.foreground_mask_cache[image_idx] = {}
-                self.foreground_mask_cache[image_idx][self._get_downscale_factor()] = {
-                    'mask_tensor': foreground_mask,
-                    'background_pixel_ratio': background_pixel_ratio,
-                }
         
         foreground_aware_reconstruction_weight = 1 / (rendered_underwater_image.detach() + 1e-3)
         foreground_aware_reconstruction_weight = torch.where(
@@ -1675,14 +2044,16 @@ class SeaFreeGsModel(Model):
         
         background_water_supervision_loss = torch.tensor(0.0, device=self.device)
         if self.config.enable_background_water_supervision and self.step < 15000:
-            if self.config.enable_water_null_occupancy and strict_water_null_probability is not None:
-                if background_pixel_ratio > 0.005:
+            used_strict_water_background = False
+            if self.config.enable_water_null_occupancy and strict_destructive_water_probability is not None:
+                if float((strict_destructive_water_probability > 0).float().mean().detach().cpu()) > 0.005:
                     background_ambient_light_weight = 1 / (water_background_image.detach() + 1e-3)
                     background_water_supervision_loss += self._weighted_mean(
                         torch.abs((water_background_image - gt_underwater_image) * background_ambient_light_weight),
-                        strict_water_null_probability.repeat(1, 1, 3),
+                        strict_destructive_water_probability.repeat(1, 1, 3),
                     )
-            elif background_pixel_ratio > 0.05:
+                    used_strict_water_background = True
+            if not used_strict_water_background and background_pixel_ratio > 0.05:
                 background_ambient_light_pixels = water_background_image[foreground_mask.repeat(1, 1, 3) < 0.5]
                 background_underwater_pixels = gt_underwater_image[foreground_mask.repeat(1, 1, 3) < 0.5]            
                 background_ambient_light_weight = 1 / (background_ambient_light_pixels.detach() + 1e-3)
@@ -1694,9 +2065,10 @@ class SeaFreeGsModel(Model):
         water_transition_alpha_loss = torch.tensor(0.0, device=self.device)
         water_intrinsic_null_loss = torch.tensor(0.0, device=self.device)
         water_background_ownership_loss = torch.tensor(0.0, device=self.device)
+        residual_water_chroma_loss = torch.tensor(0.0, device=self.device)
         if (
             self.config.enable_water_null_occupancy
-            and strict_water_null_probability is not None
+            and strict_destructive_water_probability is not None
             and self.step >= self.config.water_null_start_step
         ):
             water_empty_occupancy_loss = self._weighted_mean(
@@ -1709,12 +2081,29 @@ class SeaFreeGsModel(Model):
             )
             water_intrinsic_null_loss = self._weighted_mean(
                 torch.abs(outputs.get("intrinsic_color_render_raw", outputs["intrinsic_color_render"])),
-                strict_water_null_probability.repeat(1, 1, 3),
+                strict_destructive_water_probability.repeat(1, 1, 3),
             )
             water_background_ownership_loss = self._weighted_mean(
                 torch.abs(rendered_underwater_image - water_background_image),
-                strict_water_null_probability.repeat(1, 1, 3),
+                strict_destructive_water_probability.repeat(1, 1, 3),
             )
+            intrinsic_raw_for_chroma = outputs.get("intrinsic_color_render_raw", outputs["intrinsic_color_render"])
+            blue_residual = torch.relu(
+                intrinsic_raw_for_chroma[..., 2:3]
+                - torch.maximum(intrinsic_raw_for_chroma[..., 0:1], intrinsic_raw_for_chroma[..., 1:2])
+                - self.config.intrinsic_water_blue_margin
+            )
+            cyan_residual = torch.relu(
+                torch.minimum(intrinsic_raw_for_chroma[..., 1:2], intrinsic_raw_for_chroma[..., 2:3])
+                - intrinsic_raw_for_chroma[..., 0:1]
+                - self.config.intrinsic_water_red_deficit_margin
+            )
+            water_chroma_residual = torch.maximum(blue_residual, 0.75 * cyan_residual)
+            residual_chroma_weight = torch.maximum(
+                water_probabilities["residual_water"],
+                water_probabilities["connected_freewater"] * 0.5,
+            )
+            residual_water_chroma_loss = self._weighted_mean(water_chroma_residual, residual_chroma_weight)
 
         # CB-Loss includes foreground-weighted reconstruction and direct background
         # water supervision as its third term.
@@ -1730,6 +2119,7 @@ class SeaFreeGsModel(Model):
             "water_transition_alpha_loss": water_transition_alpha_loss * self.config.water_transition_alpha_loss_weight,
             "water_intrinsic_null_loss": water_intrinsic_null_loss * self.config.water_intrinsic_null_loss_weight,
             "water_background_ownership_loss": water_background_ownership_loss * self.config.water_background_ownership_loss_weight,
+            "residual_water_chroma_loss": residual_water_chroma_loss * self.config.residual_water_chroma_loss_weight,
         }
 
         if self.training:
@@ -1829,6 +2219,7 @@ class SeaFreeGsModel(Model):
                 gt_rgb_image,
                 outputs["water_background_image"],
                 intrinsic_raw,
+                outputs["accumulation"],
             )
             eval_water_probability = eval_water_probabilities["null"]
             eval_pure_water_probability = eval_water_probabilities["pure"]
@@ -1849,12 +2240,15 @@ class SeaFreeGsModel(Model):
             )
             eval_alpha_water = torch.maximum(
                 outputs.get("water_accumulation", torch.zeros_like(outputs["accumulation"])),
-                outputs["accumulation"] * eval_strict_water_probability,
+                outputs["accumulation"] * eval_strict_pure_probability,
             )
             eval_intrinsic_visibility = self._build_intrinsic_visibility_gate(
                 outputs["accumulation"],
                 eval_water_probability,
                 eval_alpha_water,
+                eval_water_probabilities["scene_rescue"],
+                eval_water_probabilities["residual_water"],
+                eval_water_probabilities["connected_freewater"],
             )
             intrinsic_clean = intrinsic_raw * eval_intrinsic_visibility
             images_dict['intrinsic_visibility'] = eval_intrinsic_visibility
@@ -1865,6 +2259,9 @@ class SeaFreeGsModel(Model):
             images_dict['water_horizon_probability'] = eval_water_probabilities["horizon"]
             images_dict['depth_edge_support'] = eval_water_probabilities["depth_edge_support"]
             images_dict['color_residual_support'] = eval_water_probabilities["color_residual_support"]
+            images_dict['intrinsic_scene_rescue'] = eval_water_probabilities["scene_rescue"]
+            images_dict['residual_water_probability'] = eval_water_probabilities["residual_water"]
+            images_dict['connected_freewater_probability'] = eval_water_probabilities["connected_freewater"]
         images_dict['intrinsic_color_render'] = intrinsic_clean
         
         depth_ED = outputs["depth"]
