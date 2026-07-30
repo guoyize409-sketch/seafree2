@@ -112,12 +112,20 @@ def _parse_eval_render_index(path, render_prefix):
 
 def _list_seafree_renders(renders_dir, render_prefix):
     renders_dir = Path(renders_dir)
+    exact_render_pattern = re.compile(rf"^{re.escape(render_prefix)}_(\d+)\.png$")
     renders = sorted(
-        renders_dir.glob(f"{render_prefix}_*.png"),
+        [
+            path
+            for path in renders_dir.glob(f"{render_prefix}_*.png")
+            if exact_render_pattern.match(path.name)
+        ],
         key=lambda path: _parse_eval_render_index(path, render_prefix),
     )
     if not renders:
-        raise FileNotFoundError(f"No render files matching {render_prefix}_*.png found in {renders_dir}.")
+        raise FileNotFoundError(
+            f"No exact render files matching {render_prefix}_[index].png found in {renders_dir}. "
+            f"Diagnostic files such as {render_prefix}_pre_adapter_[index].png are ignored."
+        )
     return renders
 
 
