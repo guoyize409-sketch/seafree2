@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -77,6 +77,8 @@ def rasterization(
     distributed: bool = False,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
     covars: Optional[Tensor] = None,
+    color_transform: Optional[Callable[..., Tensor]] = None,
+    collect_contributions: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -417,6 +419,17 @@ def rasterization(
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
 
+    if color_transform is not None:
+        if distributed:
+            raise NotImplementedError("Projection-aware color transforms are single-GPU only")
+        colors = color_transform(
+            colors=colors,
+            radii=radii,
+            depths=depths,
+            camera_ids=camera_ids,
+            gaussian_ids=gaussian_ids,
+        )
+
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
     # stage.
@@ -555,6 +568,7 @@ def rasterization(
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []
+        gs_contributions = None
         for i in range(n_chunks):
             colors_chunk = colors[..., i * channel_chunk : (i + 1) * channel_chunk]
             backgrounds_chunk = (
@@ -562,7 +576,7 @@ def rasterization(
                 if backgrounds is not None
                 else None
             )
-            render_colors_, render_alphas_ = rasterize_to_pixels(
+            rasterized = rasterize_to_pixels(
                 means2d,
                 conics,
                 colors_chunk,
@@ -575,13 +589,21 @@ def rasterization(
                 backgrounds=backgrounds_chunk,
                 packed=packed,
                 absgrad=absgrad,
+                collect_contributions=collect_contributions and i == 0,
             )
+            if collect_contributions and i == 0:
+                render_colors_, render_alphas_, contributions_ = rasterized
+            else:
+                render_colors_, render_alphas_ = rasterized
+                contributions_ = torch.zeros_like(opacities)
             render_colors.append(render_colors_)
             render_alphas.append(render_alphas_)
+            if i == 0:
+                gs_contributions = contributions_
         render_colors = torch.cat(render_colors, dim=-1)
         render_alphas = render_alphas[0]  # discard the rest
     else:
-        render_colors, render_alphas, gs_pixels = rasterize_to_pixels(
+        rasterized = rasterize_to_pixels(
             means2d,
             conics,
             colors,
@@ -594,7 +616,13 @@ def rasterization(
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,
+            collect_contributions=collect_contributions,
         )
+        if collect_contributions:
+            render_colors, render_alphas, gs_contributions = rasterized
+        else:
+            render_colors, render_alphas = rasterized
+            gs_contributions = torch.zeros_like(opacities)
     if render_mode in ["ED", "RGB+ED"]:
         # normalize the accumulated depth to get the expected depth
         render_colors = torch.cat(
@@ -605,7 +633,10 @@ def rasterization(
             dim=-1,
         )
         
-    meta['gs_pixels']=gs_pixels
+    assert gs_contributions is not None
+    meta["gs_contributions"] = gs_contributions
+    meta["gs_pixels"] = gs_contributions
+    meta["contributions_collected"] = collect_contributions
 
     return render_colors, render_alphas, meta
 

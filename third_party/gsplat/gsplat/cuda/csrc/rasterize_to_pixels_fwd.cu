@@ -35,7 +35,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
-    S *__restrict__ pixels // [C, N] or [nnz]
+    S *__restrict__ pixels, // [C, N] or [nnz]
+    const bool collect_contributions
     
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
@@ -166,7 +167,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             cur_idx = batch_start + t;
 
             T = next_T;
-            // gpuAtomicAdd(pixels + g, 1.0f);
+            if (collect_contributions) {
+                gpuAtomicAdd(pixels + g, vis);
+            }
         }
     }
 
@@ -203,7 +206,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kern
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,  // [n_isects]
+    const bool collect_contributions
 ) {
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
@@ -287,7 +291,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> call_kern
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
-            pixels.data_ptr<float>()
+            pixels.data_ptr<float>(),
+            collect_contributions
         );
 
     return std::make_tuple(renders, alphas, last_ids, pixels);
@@ -308,7 +313,8 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,  // [n_isects]
+    const bool collect_contributions
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -326,7 +332,8 @@ rasterize_to_pixels_fwd_tensor(
             image_height,                                                      \
             tile_size,                                                         \
             tile_offsets,                                                      \
-            flatten_ids                                                        \
+            flatten_ids,                                                       \
+            collect_contributions                                              \
         );
 
     // TODO: an optimization can be done by passing the actual number of
@@ -355,6 +362,180 @@ rasterize_to_pixels_fwd_tensor(
     default:
         AT_ERROR("Unsupported number of channels: ", channels);
     }
+}
+
+/****************************************************************************
+ * No-grad Pixel Responsibility Reduction
+ ****************************************************************************/
+
+__global__ void rasterize_responsibilities_kernel(
+    const uint32_t C,
+    const uint32_t n_isects,
+    const vec2<float> *__restrict__ means2d,
+    const vec3<float> *__restrict__ conics,
+    const float *__restrict__ opacities,
+    const float *__restrict__ responsibilities,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const int32_t *__restrict__ tile_offsets,
+    const int32_t *__restrict__ flatten_ids,
+    float *__restrict__ gaussian_mass
+) {
+    auto block = cg::this_thread_block();
+    const int32_t camera_id = block.group_index().x;
+    const int32_t tile_id =
+        block.group_index().y * tile_width + block.group_index().z;
+    const uint32_t i =
+        block.group_index().y * tile_size + block.thread_index().y;
+    const uint32_t j =
+        block.group_index().z * tile_size + block.thread_index().x;
+
+    tile_offsets += camera_id * tile_height * tile_width;
+    responsibilities += camera_id * image_height * image_width * 3;
+
+    const float px = static_cast<float>(j) + 0.5f;
+    const float py = static_cast<float>(i) + 0.5f;
+    const int32_t pix_id = i * image_width + j;
+    const bool inside = i < image_height && j < image_width;
+    bool done = !inside;
+
+    const int32_t range_start = tile_offsets[tile_id];
+    const int32_t range_end =
+        (camera_id == C - 1) &&
+                (tile_id == static_cast<int32_t>(tile_width * tile_height - 1))
+            ? n_isects
+            : tile_offsets[tile_id + 1];
+    const uint32_t block_size = block.size();
+    const uint32_t num_batches =
+        (range_end - range_start + block_size - 1) / block_size;
+
+    extern __shared__ int shared[];
+    int32_t *id_batch = reinterpret_cast<int32_t *>(shared);
+    vec3<float> *xy_opacity_batch =
+        reinterpret_cast<vec3<float> *>(&id_batch[block_size]);
+    vec3<float> *conic_batch =
+        reinterpret_cast<vec3<float> *>(&xy_opacity_batch[block_size]);
+
+    float T = 1.0f;
+    const uint32_t thread_rank = block.thread_rank();
+    for (uint32_t batch = 0; batch < num_batches; ++batch) {
+        if (__syncthreads_count(done) >= block_size) {
+            break;
+        }
+        const uint32_t batch_start = range_start + block_size * batch;
+        const uint32_t idx = batch_start + thread_rank;
+        if (idx < static_cast<uint32_t>(range_end)) {
+            const int32_t gaussian_id = flatten_ids[idx];
+            id_batch[thread_rank] = gaussian_id;
+            const vec2<float> xy = means2d[gaussian_id];
+            xy_opacity_batch[thread_rank] = {
+                xy.x, xy.y, opacities[gaussian_id]
+            };
+            conic_batch[thread_rank] = conics[gaussian_id];
+        }
+        block.sync();
+
+        const uint32_t batch_size = min(block_size, range_end - batch_start);
+        for (uint32_t item = 0; item < batch_size && !done; ++item) {
+            const vec3<float> conic = conic_batch[item];
+            const vec3<float> xy_opacity = xy_opacity_batch[item];
+            const vec2<float> delta = {xy_opacity.x - px, xy_opacity.y - py};
+            const float sigma =
+                0.5f * (conic.x * delta.x * delta.x +
+                        conic.z * delta.y * delta.y) +
+                conic.y * delta.x * delta.y;
+            const float alpha =
+                min(0.999f, xy_opacity.z * __expf(-sigma));
+            if (sigma < 0.0f || alpha < 1.0f / 255.0f) {
+                continue;
+            }
+
+            const float next_T = T * (1.0f - alpha);
+            if (next_T <= 1e-4f) {
+                done = true;
+                break;
+            }
+
+            const float r0 = max(responsibilities[pix_id * 3], 0.0f);
+            const float r1 = max(responsibilities[pix_id * 3 + 1], 0.0f);
+            const float r2 = max(responsibilities[pix_id * 3 + 2], 0.0f);
+            const float responsibility_sum = r0 + r1 + r2;
+            if (responsibility_sum > 1e-6f) {
+                const float visibility = alpha * T / responsibility_sum;
+                const int32_t gaussian_id = id_batch[item];
+                gpuAtomicAdd(gaussian_mass + gaussian_id * 3, visibility * r0);
+                gpuAtomicAdd(gaussian_mass + gaussian_id * 3 + 1, visibility * r1);
+                gpuAtomicAdd(gaussian_mass + gaussian_id * 3 + 2, visibility * r2);
+            }
+            T = next_T;
+        }
+    }
+}
+
+torch::Tensor rasterize_responsibilities_tensor(
+    const torch::Tensor &means2d,
+    const torch::Tensor &conics,
+    const torch::Tensor &opacities,
+    const torch::Tensor &responsibilities,
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const torch::Tensor &tile_offsets,
+    const torch::Tensor &flatten_ids
+) {
+    GSPLAT_DEVICE_GUARD(means2d);
+    GSPLAT_CHECK_INPUT(means2d);
+    GSPLAT_CHECK_INPUT(conics);
+    GSPLAT_CHECK_INPUT(opacities);
+    GSPLAT_CHECK_INPUT(responsibilities);
+    GSPLAT_CHECK_INPUT(tile_offsets);
+    GSPLAT_CHECK_INPUT(flatten_ids);
+    TORCH_CHECK(means2d.scalar_type() == torch::kFloat32, "means2d must be float32");
+    TORCH_CHECK(conics.scalar_type() == torch::kFloat32, "conics must be float32");
+    TORCH_CHECK(opacities.scalar_type() == torch::kFloat32, "opacities must be float32");
+    TORCH_CHECK(
+        responsibilities.scalar_type() == torch::kFloat32,
+        "responsibilities must be float32"
+    );
+    TORCH_CHECK(
+        responsibilities.dim() == 4 && responsibilities.size(3) == 3,
+        "responsibilities must have shape [C,H,W,3]"
+    );
+
+    const uint32_t C = tile_offsets.size(0);
+    const uint32_t tile_height = tile_offsets.size(1);
+    const uint32_t tile_width = tile_offsets.size(2);
+    const uint32_t n_isects = flatten_ids.size(0);
+    torch::Tensor gaussian_mass = torch::zeros(
+        {opacities.numel(), 3}, opacities.options().dtype(torch::kFloat32)
+    );
+
+    const dim3 threads = {tile_size, tile_size, 1};
+    const dim3 blocks = {C, tile_height, tile_width};
+    const uint32_t shared_mem =
+        tile_size * tile_size *
+        (sizeof(int32_t) + sizeof(vec3<float>) + sizeof(vec3<float>));
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+    rasterize_responsibilities_kernel<<<blocks, threads, shared_mem, stream>>>(
+        C,
+        n_isects,
+        reinterpret_cast<vec2<float> *>(means2d.data_ptr<float>()),
+        reinterpret_cast<vec3<float> *>(conics.data_ptr<float>()),
+        opacities.data_ptr<float>(),
+        responsibilities.data_ptr<float>(),
+        image_width,
+        image_height,
+        tile_size,
+        tile_width,
+        tile_height,
+        tile_offsets.data_ptr<int32_t>(),
+        flatten_ids.data_ptr<int32_t>(),
+        gaussian_mass.data_ptr<float>()
+    );
+    return gaussian_mass;
 }
 
 } // namespace gsplat

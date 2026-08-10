@@ -180,7 +180,20 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,  // [n_isects]
+    const bool collect_contributions
+);
+
+torch::Tensor rasterize_responsibilities_tensor(
+    const torch::Tensor &means2d,          // [C, N, 2] or [nnz, 2]
+    const torch::Tensor &conics,           // [C, N, 3] or [nnz, 3]
+    const torch::Tensor &opacities,        // [C, N] or [nnz]
+    const torch::Tensor &responsibilities, // [C, H, W, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const torch::Tensor &tile_offsets,     // [C, tile_height, tile_width]
+    const torch::Tensor &flatten_ids       // [n_isects]
 );
 
 std::tuple<

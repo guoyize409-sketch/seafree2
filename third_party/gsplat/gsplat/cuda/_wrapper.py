@@ -447,7 +447,8 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
-) -> Tuple[Tensor, Tensor]:
+    collect_contributions: bool = False,
+) -> Any:
     """Rasterizes Gaussians to pixels.
 
     Args:
@@ -464,12 +465,14 @@ def rasterize_to_pixels(
         masks: Optional tile mask to skip rendering GS to masked tiles. [C, tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        collect_contributions: If True, also return accumulated alpha visibility per Gaussian. Default: False.
 
     Returns:
         A tuple:
 
         - **Rendered colors**. [C, image_height, image_width, channels]
         - **Rendered alphas**. [C, image_height, image_width, 1]
+        - **Gaussian contributions** when ``collect_contributions`` is True. [C, N] or [nnz]
     """
 
     C = isect_offsets.size(0)
@@ -561,11 +564,48 @@ def rasterize_to_pixels(
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
         absgrad,
+        collect_contributions,
     )
 
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
-    return render_colors, render_alphas, gs_pixels
+    if collect_contributions:
+        return render_colors, render_alphas, gs_pixels
+    return render_colors, render_alphas
+
+
+@torch.no_grad()
+def rasterize_responsibilities(
+    means2d: Tensor,  # [C, N, 2] or [nnz, 2]
+    conics: Tensor,  # [C, N, 3] or [nnz, 3]
+    opacities: Tensor,  # [C, N] or [nnz]
+    responsibilities: Tensor,  # [C, H, W, 3]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+) -> Tensor:
+    """Accumulate exact pixel responsibility mass for each Gaussian.
+
+    This reuses the sorted raster intersections and evaluates only alpha
+    visibility. It has no color buffer and no autograd graph.
+    """
+    C = isect_offsets.shape[0]
+    assert responsibilities.shape == (C, image_height, image_width, 3)
+    assert opacities.dim() in (1, 2)
+    mass = _make_lazy_cuda_func("rasterize_responsibilities")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        responsibilities.float().contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+    return mass.view(*opacities.shape, 3)
 
 
 @torch.no_grad()
@@ -916,7 +956,8 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
-    ) -> Tuple[Tensor, Tensor]:
+        collect_contributions: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         render_colors, render_alphas, last_ids, pixels = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
         )(
@@ -931,6 +972,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
+            collect_contributions,
         )
 
         ctx.save_for_backward(
@@ -1019,6 +1061,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_backgrounds,
+            None,
             None,
             None,
             None,

@@ -93,6 +93,15 @@ SeaFreeGsMethod = MethodSpecification(
                     max_steps=30000,
                 ),
             },
+            "water_transport_field": {
+                "optimizer": AdamOptimizerConfig(lr=3e-4, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=8e-5,
+                    max_steps=23000,
+                    warmup_steps=15000,
+                    lr_pre_warmup=0,
+                ),
+            },
             "line_of_sight_direction_encoding": {
                 "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(

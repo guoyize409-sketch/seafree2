@@ -26,9 +26,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import cv2
-import numpy as np
-
 from gsplat.strategy import DefaultStrategy
 
 try:
@@ -55,6 +52,8 @@ from nerfstudio.field_components.mlp import MLP
 from nerfstudio.field_components.encodings import SHEncoding
 
 from seafree_gs.math import k_nearest_sklearn, random_quat_tensor
+from seafree_gs.aquanull3d import SurfaceCarrierField
+from seafree_gs.path_integrated_water import CompactHeterogeneousWaterField, PathIntegratedWaterRenderer
 from seafree_gs.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 
 from torchmetrics.functional.regression import pearson_corrcoef
@@ -281,8 +280,8 @@ class SeaFreeGsModelConfig(ModelConfig):
     """Minimum residual-water confidence retained even when scene rescue is non-zero."""
     residual_water_chroma_loss_weight: float = 0.01
     """Penalty weight for blue-channel residuals in raw intrinsic water-color regions."""
-    enable_connected_freewater_prior: bool = True
-    """Use soft border-connected water evidence to suppress free-water sheets and bands."""
+    enable_connected_freewater_prior: bool = False
+    """Legacy 2D connectivity prior. The 3D dual carrier supersedes it."""
     connected_freewater_iterations: int = 24
     """Number of 3x3 soft dilation steps for the border-connected freewater prior."""
     connected_freewater_strength: float = 0.85
@@ -449,6 +448,42 @@ class SeaFreeGsModelConfig(ModelConfig):
     """Required water-vs-scene exposure ratio for water-aware pruning."""
     water_prune_max_fraction: float = 0.005
     """Maximum fraction of current Gaussians pruned by the water-aware pass at one refine step."""
+
+    enable_aquanull3d: bool = True
+    """Use persistent multi-view 3D surface-carrier certification."""
+    carrier_update_every: int = 100
+    """Update carrier evidence every N training iterations."""
+    carrier_min_distinct_views: int = 6
+    """Minimum distinct observations before carrier evidence can suppress a Gaussian."""
+    carrier_warmup_steps: int = 4000
+    """Keep exact AquaNull-LVSF geometry while WPP and GS appearance stabilize."""
+    carrier_epoch_steps: int = 0
+    """Rolling evidence epoch length; zero derives it from camera count."""
+    carrier_min_certified_epochs: int = 2
+    """Consecutive multi-view epochs required before committing ownership."""
+    carrier_chunk_size: int = 262144
+    """Maximum number of projected Gaussians processed by one carrier update chunk."""
+    carrier_growth_start_step: int = 4000
+    """Start blocking growth of repeatedly observed non-surface Gaussians."""
+    carrier_prune_start_step: int = 16000
+    """Start conservative carrier pruning after normal densification has stopped."""
+    carrier_prune_max_fraction: float = 0.0025
+    """Maximum fraction removed by carrier pruning at one refinement iteration."""
+
+    enable_path_integrated_transport: bool = True
+    """Use the bounded scene-global field and analytic per-Gaussian transport."""
+    water_field_resolution: int = 24
+    water_query_downscale: int = 8
+    water_transport_depth_scale: float = 10.0
+    water_transport_far_distance: float = 4.0
+    water_field_start_step: int = 15000
+    """Start learning spatial transport after normal GS densification."""
+    water_field_freeze_step: int = 23000
+    """Freeze the medium field and leave the final iterations to GS stabilization."""
+    water_field_ambient_residual_scale: float = 0.04
+    """Maximum low-rank spatial ambient residual around the WPP."""
+    water_field_coefficient_log_scale: float = 0.20
+    """Maximum log residual for low-rank attenuation/backscatter correction."""
     
 class SeaFreeGsModel(Model):
     """SeaFree-GS model for underwater 3D Gaussian Splatting.
@@ -467,6 +502,26 @@ class SeaFreeGsModel(Model):
         **kwargs,
     ):
         self.seed_points = seed_points
+        metadata = kwargs.get("metadata") or {}
+        sfm_error = metadata.get("points3D_error")
+        sfm_tracks = metadata.get("points3D_num_points2D")
+        self.seed_sfm_reliability: Optional[torch.Tensor] = None
+        if (
+            seed_points is not None
+            and isinstance(sfm_error, torch.Tensor)
+            and isinstance(sfm_tracks, torch.Tensor)
+            and sfm_error.numel() == seed_points[0].shape[0]
+            and sfm_tracks.numel() == seed_points[0].shape[0]
+        ):
+            error = sfm_error.detach().float().clamp_min(0.0)
+            tracks = sfm_tracks.detach().float().clamp_min(0.0)
+            positive_error = error[error > 0]
+            error_scale = (
+                positive_error.median() if positive_error.numel() > 0 else error.new_tensor(1.0)
+            ).clamp_min(1e-4)
+            track_support = tracks / (tracks + 4.0)
+            reprojection_support = torch.exp(-error / (2.0 * error_scale))
+            self.seed_sfm_reliability = (track_support * reprojection_support).clamp(0.0, 1.0)
         self.max_depth = max_depth * 4
         super().__init__(*args, **kwargs)
 
@@ -516,10 +571,44 @@ class SeaFreeGsModel(Model):
             "water_calibrator_ambient_delta": 0.050,
             "water_calibrator_coeff_log_scale": 0.32,
             "water_calibrator_l2_weight": 0.0006,
+            "enable_aquanull3d": True,
+            "carrier_update_every": 100,
+            "carrier_min_distinct_views": 6,
+            "carrier_warmup_steps": 4000,
+            "carrier_epoch_steps": 0,
+            "carrier_min_certified_epochs": 2,
+            "carrier_chunk_size": 262144,
+            "carrier_growth_start_step": 4000,
+            "carrier_prune_start_step": 16000,
+            "carrier_prune_max_fraction": 0.0025,
+            "enable_path_integrated_transport": True,
+            "water_field_resolution": 24,
+            "water_query_downscale": 8,
+            "water_transport_depth_scale": 10.0,
+            "water_transport_far_distance": 4.0,
+            "water_field_start_step": 15000,
+            "water_field_freeze_step": 23000,
+            "water_field_ambient_residual_scale": 0.04,
+            "water_field_coefficient_log_scale": 0.20,
         }
         for name, value in defaults.items():
             if not hasattr(self.config, name):
                 setattr(self.config, name, value)
+
+    def _uses_nextgen_water_model(self) -> bool:
+        # The standalone nextgen branch replaced the validated LVSF pipeline and
+        # caused the v1/v2 regressions. New modules are integrated into LVSF.
+        return False
+
+    def _uses_surface_carrier(self) -> bool:
+        return bool(self.config.enable_aquanull3d)
+
+    def _uses_legacy_water_lifecycle(self) -> bool:
+        return (
+            not self._uses_surface_carrier()
+            or self.config.enable_water_lifecycle_growth_suppression
+            or self.config.enable_water_lifecycle_pruning
+        )
 
     def populate_modules(self):
         self._ensure_responsibility_config_defaults()
@@ -647,18 +736,48 @@ class SeaFreeGsModel(Model):
             continue_cull_post_densification=self.config.continue_cull_post_densification,
         )
         self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
-        self.strategy_state["water_exposure_score"] = torch.zeros(num_points, device=means.device)
-        self.strategy_state["scene_exposure_score"] = torch.zeros(num_points, device=means.device)
-        self.strategy_state["depth_edge_support_score"] = torch.zeros(num_points, device=means.device)
-        self.strategy_state["color_residual_support_score"] = torch.zeros(num_points, device=means.device)
-        self.strategy_state["view_consistency_score"] = torch.zeros(num_points, device=means.device)
+        if self._uses_legacy_water_lifecycle():
+            self.strategy_state["water_exposure_score"] = torch.zeros(num_points, device=means.device)
+            self.strategy_state["scene_exposure_score"] = torch.zeros(num_points, device=means.device)
+            self.strategy_state["depth_edge_support_score"] = torch.zeros(num_points, device=means.device)
+            self.strategy_state["color_residual_support_score"] = torch.zeros(num_points, device=means.device)
+            self.strategy_state["view_consistency_score"] = torch.zeros(num_points, device=means.device)
+
+        self.surface_carrier = SurfaceCarrierField(
+            num_points=num_points,
+            device=means.device,
+            update_every=self.config.carrier_update_every,
+            min_distinct_views=self.config.carrier_min_distinct_views,
+            num_train_views=self.num_train_data,
+            warmup_steps=self.config.carrier_warmup_steps,
+            epoch_steps=self.config.carrier_epoch_steps,
+            min_certified_epochs=self.config.carrier_min_certified_epochs,
+            depth_scale=self.config.water_transport_depth_scale,
+            chunk_size=self.config.carrier_chunk_size,
+            sfm_reliability=self.seed_sfm_reliability,
+        )
+        water_field = CompactHeterogeneousWaterField(
+            resolution=self.config.water_field_resolution,
+        )
+        # SceneBox is already robustly normalized by the dataparser and avoids
+        # an additional CPU pass over the full COLMAP cloud.
+        water_field.set_bounds(self.scene_box.aabb.to(means))
+        self.path_integrated_renderer = PathIntegratedWaterRenderer(
+            field=water_field,
+            query_downscale=self.config.water_query_downscale,
+            depth_scale=self.config.water_transport_depth_scale,
+            far_distance=self.config.water_transport_far_distance,
+        )
+        if self._uses_surface_carrier():
+            self.surface_carrier.bind_strategy_state(self.strategy_state)
         
         self.foreground_mask_cache = {}
-        self.register_buffer("water_exposure_score", torch.zeros(num_points), persistent=False)
-        self.register_buffer("scene_exposure_score", torch.zeros(num_points), persistent=False)
-        self.register_buffer("depth_edge_support_score", torch.zeros(num_points), persistent=False)
-        self.register_buffer("color_residual_support_score", torch.zeros(num_points), persistent=False)
-        self.register_buffer("view_consistency_score", torch.zeros(num_points), persistent=False)
+        legacy_state_size = num_points if self._uses_legacy_water_lifecycle() else 0
+        self.register_buffer("water_exposure_score", torch.zeros(legacy_state_size), persistent=False)
+        self.register_buffer("scene_exposure_score", torch.zeros(legacy_state_size), persistent=False)
+        self.register_buffer("depth_edge_support_score", torch.zeros(legacy_state_size), persistent=False)
+        self.register_buffer("color_residual_support_score", torch.zeros(legacy_state_size), persistent=False)
+        self.register_buffer("view_consistency_score", torch.zeros(legacy_state_size), persistent=False)
         self.last_water_probability_mean = torch.tensor(0.0)
         self.last_water_pure_probability_mean = torch.tensor(0.0)
         self.last_water_transition_probability_mean = torch.tensor(0.0)
@@ -730,6 +849,7 @@ class SeaFreeGsModel(Model):
 
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
+        dict = dict.copy()
         self.step = 30000
         if "means" in dict:
             # For backwards compatibility, we remap the names of parameters from
@@ -741,6 +861,7 @@ class SeaFreeGsModel(Model):
             old_shape = param.shape
             new_shape = (newp,) + old_shape[1:]
             self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
+        self.surface_carrier.resize(newp, self.gauss_params["means"].device)
         strict = kwargs.pop("strict", True)
         if self.config.enable_water_formation_calibrator:
             calibrator_keys = {
@@ -749,7 +870,65 @@ class SeaFreeGsModel(Model):
             }
             if any(key not in dict for key in calibrator_keys):
                 strict = False
+        nextgen_keys = {
+            key
+            for key in self.state_dict().keys()
+            if key.startswith("surface_carrier.")
+            or key.startswith("path_integrated_renderer.")
+        }
+        has_water_field_bounds = all(
+            key in dict
+            for key in (
+                "path_integrated_renderer.field.aabb_min",
+                "path_integrated_renderer.field.aabb_max",
+            )
+        )
+        carrier_is_redesigned = all(
+            key in dict
+            for key in (
+                "surface_carrier.medium_evidence",
+                "surface_carrier.certified_state",
+                "surface_carrier.epoch_index",
+            )
+        )
+        transport_is_redesigned = all(
+            key in dict
+            for key in (
+                "path_integrated_renderer.field.planes",
+                "path_integrated_renderer.field.latent_running_mean",
+            )
+        )
+        if not carrier_is_redesigned:
+            for key in [key for key in dict if key.startswith("surface_carrier.")]:
+                dict.pop(key)
+            strict = False
+        if not transport_is_redesigned:
+            for key in [
+                key for key in dict if key.startswith("path_integrated_renderer.")
+            ]:
+                dict.pop(key)
+            has_water_field_bounds = False
+            strict = False
+        if any(key not in dict for key in nextgen_keys):
+            strict = False
+        current_state = self.state_dict()
+        for key in list(dict.keys()):
+            if not (
+                key.startswith("surface_carrier.")
+                or key.startswith("path_integrated_renderer.")
+            ):
+                continue
+            if key in current_state and current_state[key].shape != dict[key].shape:
+                # The redesigned modules intentionally changed persistent state.
+                # Older v1 checkpoints still load their GS parameters while the
+                # incompatible carrier/medium state is reinitialized safely.
+                dict.pop(key)
+                strict = False
         super().load_state_dict(dict, strict=strict, **kwargs)
+        if not has_water_field_bounds:
+            self.path_integrated_renderer.field.set_bounds(self.means)
+        if self._uses_surface_carrier():
+            self.surface_carrier.bind_strategy_state(self.strategy_state)
 
     def set_crop(self, crop_box: Optional[OrientedBox]):
         self.crop_box = crop_box
@@ -760,22 +939,50 @@ class SeaFreeGsModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
+        no_grow_mask = None
+        prune_mask = None
         if self.config.enable_water_null_occupancy:
             if self.config.enable_water_lifecycle_growth_suppression:
                 self._suppress_water_dominated_growth()
-                water_no_grow_mask = self._get_water_lifecycle_no_grow_mask()
-                if hasattr(self.strategy, "set_external_no_grow_mask"):
-                    self.strategy.set_external_no_grow_mask(water_no_grow_mask)
-                self.last_water_no_grow_candidates = int(water_no_grow_mask.sum().item()) if water_no_grow_mask is not None else 0
-            else:
-                self.last_water_no_grow_candidates = 0
+                no_grow_mask = self._get_water_lifecycle_no_grow_mask()
             if self.config.enable_water_lifecycle_pruning:
-                water_prune_mask = self._get_water_lifecycle_prune_mask()
-                if hasattr(self.strategy, "set_external_prune_mask"):
-                    self.strategy.set_external_prune_mask(water_prune_mask)
-                self.last_water_prune_candidates = int(water_prune_mask.sum().item()) if water_prune_mask is not None else 0
-            else:
-                self.last_water_prune_candidates = 0
+                prune_mask = self._get_water_lifecycle_prune_mask()
+
+        if self._uses_surface_carrier() and step % self.config.refine_every == 0:
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
+            carrier_no_grow, carrier_prune = self.surface_carrier.lifecycle_masks(
+                step=step,
+                grow_start=self.config.carrier_growth_start_step,
+                prune_start=self.config.carrier_prune_start_step,
+                max_prune_fraction=self.config.carrier_prune_max_fraction,
+            )
+            if carrier_no_grow is not None:
+                no_grow_mask = (
+                    carrier_no_grow
+                    if no_grow_mask is None
+                    else torch.logical_or(no_grow_mask, carrier_no_grow)
+                )
+            if carrier_prune is not None:
+                prune_mask = (
+                    carrier_prune
+                    if prune_mask is None
+                    else torch.logical_or(prune_mask, carrier_prune)
+                )
+
+        if prune_mask is not None and bool(prune_mask.any().item()):
+            # External pruning runs before growth. A no-grow mask still has the
+            # pre-prune length and therefore cannot be applied in the same pass.
+            no_grow_mask = None
+        if hasattr(self.strategy, "set_external_no_grow_mask"):
+            self.strategy.set_external_no_grow_mask(no_grow_mask)
+        if hasattr(self.strategy, "set_external_prune_mask"):
+            self.strategy.set_external_prune_mask(prune_mask)
+        self.last_water_no_grow_candidates = (
+            int(no_grow_mask.sum().item()) if no_grow_mask is not None else 0
+        )
+        self.last_water_prune_candidates = (
+            int(prune_mask.sum().item()) if prune_mask is not None else 0
+        )
         n_before_refine = self.num_points
         self.strategy.step_post_backward(
             params=self.gauss_params,
@@ -787,6 +994,8 @@ class SeaFreeGsModel(Model):
         )
         if self.config.enable_water_null_occupancy:
             self._sync_water_lifecycle_buffers(n_before_refine)
+        elif self._uses_surface_carrier():
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -810,6 +1019,12 @@ class SeaFreeGsModel(Model):
     def step_cb(self, optimizers: Optimizers, step):
         self.step = step
         self.optimizers = optimizers.optimizers
+        field_trainable = (
+            self.config.enable_path_integrated_transport
+            and self.config.water_field_start_step <= step < self.config.water_field_freeze_step
+        )
+        for parameter in self.path_integrated_renderer.field.parameters():
+            parameter.requires_grad_(field_trainable)
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
@@ -834,6 +1049,10 @@ class SeaFreeGsModel(Model):
         if self.config.enable_water_formation_calibrator:
             water_properties_params += list(self.water_formation_calibrator.parameters())
         gps["water_properties_predictor"] = water_properties_params
+        if self.config.enable_path_integrated_transport:
+            gps["water_transport_field"] = list(
+                self.path_integrated_renderer.field.parameters()
+            )
         gps["line_of_sight_direction_encoding"] = list(self.line_of_sight_direction_encoding.parameters())
                     
         self.camera_optimizer.get_param_groups(param_groups=gps)
@@ -908,7 +1127,11 @@ class SeaFreeGsModel(Model):
         support: torch.Tensor,
     ) -> torch.Tensor:
         """Softly propagate water evidence from image borders through water-like support."""
-        if not self.config.enable_connected_freewater_prior or seed.numel() == 0:
+        if (
+            not self.config.enable_connected_freewater_prior
+            or self._uses_surface_carrier()
+            or seed.numel() == 0
+        ):
             return torch.zeros_like(seed)
 
         seed_2d = seed.detach().squeeze(-1).clamp(0.0, 1.0)
@@ -1660,8 +1883,9 @@ class SeaFreeGsModel(Model):
         height, width = score.shape[:2]
         top_rows = max(1, int(height * 0.20))
         top_strength = score[:top_rows, :].mean(dim=0)
-        if float(top_strength.mean().detach().cpu()) < self.config.water_horizon_min_confidence:
-            return torch.zeros_like(base_transition)
+        horizon_active = (
+            top_strength.mean() >= self.config.water_horizon_min_confidence
+        ).to(score)
 
         y = torch.linspace(0.0, 1.0, height, device=score.device, dtype=score.dtype)
         top_bias = (1.0 - y).clamp_min(0.0)[:, None]
@@ -1671,7 +1895,12 @@ class SeaFreeGsModel(Model):
 
         band = max(self.config.water_horizon_band, 1e-3)
         prior = torch.sigmoid((boundary[None, :] - y[:, None]) / band * 6.0)
-        prior = prior * top_strength[None, :].clamp(0.0, 1.0) * self.config.water_horizon_strength
+        prior = (
+            prior
+            * top_strength[None, :].clamp(0.0, 1.0)
+            * self.config.water_horizon_strength
+            * horizon_active
+        )
         return prior[..., None].clamp(0.0, 1.0)
 
     def _build_water_null_probabilities(
@@ -2046,33 +2275,25 @@ class SeaFreeGsModel(Model):
         self,
         pseudo_depth: torch.Tensor,
         image_idx,
-    ) -> Tuple[torch.Tensor, float]:
-        """Original SeaFree-GS foreground mask from pseudo-depth contours."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """GPU-only foreground support from pseudo-depth morphology."""
         downscale = self._get_downscale_factor()
         if image_idx in self.foreground_mask_cache.keys() and downscale in self.foreground_mask_cache[image_idx].keys():
             cached = self.foreground_mask_cache[image_idx][downscale]
             return cached["mask_tensor"], cached["background_pixel_ratio"]
 
         background_depth_threshold = 1e-2
-        pseudo_depth_numpy = pseudo_depth.squeeze().detach().cpu().numpy()
-        mask_1e_2_copy = (pseudo_depth_numpy < background_depth_threshold).astype(np.uint8) * 255
-        _, binary_image = cv2.threshold(mask_1e_2_copy, 127, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        foreground_mask_array = np.zeros_like(binary_image)
-        if len(contours) > 0:
-            max_contour = max(contours, key=cv2.contourArea)
-            cv2.drawContours(foreground_mask_array, [max_contour], -1, (255,), thickness=cv2.FILLED)
-        foreground_mask_array = foreground_mask_array.astype(np.float32) / 255
-        foreground_mask_array[foreground_mask_array < background_depth_threshold] = 0
-        foreground_mask_array[foreground_mask_array > 0] = 1
-
-        foreground_mask = torch.from_numpy(foreground_mask_array).float()
-        foreground_mask = foreground_mask.to(device=pseudo_depth.device, dtype=pseudo_depth.dtype)
-        foreground_mask.unsqueeze_(-1)
-
-        total_pixels = foreground_mask_array.size
-        background_pixels = foreground_mask_array[foreground_mask_array < 0.5]
-        background_pixel_ratio = background_pixels.size / total_pixels
+        foreground_chw = (pseudo_depth[..., :1].detach() > background_depth_threshold).to(
+            pseudo_depth.dtype
+        ).permute(2, 0, 1).unsqueeze(0)
+        # Closing fills small depth holes without a CPU contour pass. A following
+        # opening removes isolated pseudo-depth responses in empty water.
+        foreground_chw = F.max_pool2d(foreground_chw, 5, stride=1, padding=2)
+        foreground_chw = -F.max_pool2d(-foreground_chw, 5, stride=1, padding=2)
+        foreground_chw = -F.max_pool2d(-foreground_chw, 3, stride=1, padding=1)
+        foreground_chw = F.max_pool2d(foreground_chw, 3, stride=1, padding=1)
+        foreground_mask = foreground_chw.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
+        background_pixel_ratio = (1.0 - foreground_mask).mean().detach()
 
         if image_idx not in self.foreground_mask_cache.keys():
             self.foreground_mask_cache[image_idx] = {}
@@ -2156,6 +2377,11 @@ class SeaFreeGsModel(Model):
         empty_freewater_probability: Optional[torch.Tensor] = None,
         attached_veil_probability: Optional[torch.Tensor] = None,
         scene_core_probability: Optional[torch.Tensor] = None,
+        water_similarity_probability: Optional[torch.Tensor] = None,
+        low_structure_probability: Optional[torch.Tensor] = None,
+        water_only_advantage: Optional[torch.Tensor] = None,
+        view_id: Optional[torch.Tensor] = None,
+        valid_image_mask: Optional[torch.Tensor] = None,
     ):
         """Accumulate per-Gaussian cross-view responsibility evidence."""
         if not self.training or not self.config.enable_water_null_occupancy:
@@ -2168,15 +2394,6 @@ class SeaFreeGsModel(Model):
         if means2d is None or radii is None or means2d.dim() != 3:
             return
 
-        self._ensure_water_lifecycle_buffers()
-        water_score = self.strategy_state["water_exposure_score"]
-        scene_score = self.strategy_state["scene_exposure_score"]
-        depth_edge_score = self.strategy_state["depth_edge_support_score"]
-        color_residual_score = self.strategy_state["color_residual_support_score"]
-        view_consistency_score = self.strategy_state["view_consistency_score"]
-        empty_score = self.strategy_state["empty_freewater_exposure_score"]
-        attached_score = self.strategy_state["attached_veil_exposure_score"]
-        scene_core_score = self.strategy_state["scene_core_exposure_score"]
         height, width = water_probability.shape[:2]
         if scene_probability is None:
             scene_probability = (1.0 - water_probability).clamp(0.0, 1.0)
@@ -2192,6 +2409,72 @@ class SeaFreeGsModel(Model):
             attached_veil_probability = haze_probability
         if scene_core_probability is None:
             scene_core_probability = scene_probability
+        if water_similarity_probability is None:
+            water_similarity_probability = water_probability
+        if low_structure_probability is None:
+            low_structure_probability = (1.0 - depth_edge_support).clamp(0.0, 1.0)
+        if water_only_advantage is None:
+            water_only_advantage = torch.zeros_like(water_probability)
+        if (
+            self._uses_surface_carrier()
+            and view_id is not None
+            and self.step % self.config.carrier_update_every == 0
+        ):
+            water_context = (
+                water_similarity_probability.detach().clamp(0.0, 1.0)
+                * low_structure_probability.detach().clamp(0.0, 1.0)
+            )
+            medium_probability = torch.maximum(
+                empty_freewater_probability.detach().clamp(0.0, 1.0),
+                attached_veil_probability.detach().clamp(0.0, 1.0) * water_context,
+            )
+            medium_probability = torch.maximum(
+                medium_probability,
+                water_only_advantage.detach().clamp(0.0, 1.0) * water_context,
+            )
+            # Scene-core colour is only geometric evidence when it is backed by
+            # structure or disagrees with the physical water-only hypothesis.
+            scene_support = (1.0 - water_context).clamp(0.0, 1.0)
+            surface_probability = torch.maximum(
+                depth_edge_support.detach().clamp(0.0, 1.0),
+                scene_core_probability.detach().clamp(0.0, 1.0)
+                * (0.15 + 0.85 * scene_support),
+            )
+            ambiguity = torch.minimum(medium_probability, surface_probability)
+            uncertainty_probability = torch.maximum(
+                (1.0 - torch.maximum(medium_probability, surface_probability)).clamp(0.0, 1.0),
+                0.5 * ambiguity,
+            )
+            responsibility_mass = self.surface_carrier.rasterize_responsibility_mass(
+                info=self.info,
+                medium=medium_probability,
+                surface=surface_probability,
+                uncertainty=uncertainty_probability,
+                valid_image_mask=valid_image_mask,
+            )
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
+            self.surface_carrier.update_from_responsibilities(
+                step=self.step,
+                view_id=view_id,
+                info=self.info,
+                medium=medium_probability,
+                surface=surface_probability,
+                uncertainty=uncertainty_probability,
+                responsibility_mass=responsibility_mass,
+                valid_image_mask=valid_image_mask,
+            )
+
+        if not self._uses_legacy_water_lifecycle():
+            return
+        self._ensure_water_lifecycle_buffers()
+        water_score = self.strategy_state["water_exposure_score"]
+        scene_score = self.strategy_state["scene_exposure_score"]
+        depth_edge_score = self.strategy_state["depth_edge_support_score"]
+        color_residual_score = self.strategy_state["color_residual_support_score"]
+        view_consistency_score = self.strategy_state["view_consistency_score"]
+        empty_score = self.strategy_state["empty_freewater_exposure_score"]
+        attached_score = self.strategy_state["attached_veil_exposure_score"]
+        scene_core_score = self.strategy_state["scene_core_exposure_score"]
         xy = means2d[0].detach()
         radii0 = radii[0].detach()
         x_float = xy[:, 0]
@@ -2434,7 +2717,11 @@ class SeaFreeGsModel(Model):
 
     def _sync_water_lifecycle_buffers(self, n_before_refine: int):
         """Mirror lifecycle scores after gsplat changes the Gaussian table length."""
-        self._ensure_water_lifecycle_buffers()
+        del n_before_refine
+        if self._uses_legacy_water_lifecycle():
+            self._ensure_water_lifecycle_buffers()
+        if self._uses_surface_carrier():
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
 
     def _gaussian_responsibility_scores(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return per-Gaussian freewater / scene / haze scores from cross-view evidence."""
@@ -2460,6 +2747,13 @@ class SeaFreeGsModel(Model):
         freewater = (freewater_ratio * edge_guard * residual_guard * consistency_guard).clamp(0.0, 1.0)
         scene = torch.maximum(scene_ratio, 0.35 * (1.0 - freewater)).clamp(0.0, 1.0)
         haze = (haze_ratio * (1.0 - freewater)).clamp(0.0, 1.0)
+        if self._uses_surface_carrier():
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
+            ownership = self.surface_carrier.probabilities()
+            certified = ownership["certified"]
+            freewater = torch.where(certified, ownership["freewater"], freewater)
+            scene = torch.where(certified, ownership["scene"], scene)
+            haze = torch.where(certified, ownership["haze"], haze)
         return freewater.unsqueeze(-1), scene.unsqueeze(-1), haze.unsqueeze(-1)
 
     def _gaussian_null_dominance_score(self) -> torch.Tensor:
@@ -2620,8 +2914,10 @@ class SeaFreeGsModel(Model):
     @staticmethod
     def get_empty_outputs(width: int, height: int, background: torch.Tensor) -> Dict[str, Union[torch.Tensor, List]]:
         rgb = background.repeat(height, width, 1)
+        black = background.new_zeros(height, width, 3)
         depth = background.new_ones(*rgb.shape[:2], 1) * 10
         accumulation = background.new_zeros(*rgb.shape[:2], 1)
+        freewater = torch.ones_like(accumulation)
         water_background_image = rgb.clone()
         water_coefficients = background.new_zeros(*rgb.shape[:2], 3)
         return {
@@ -2629,22 +2925,24 @@ class SeaFreeGsModel(Model):
             "depth": depth,
             "accumulation": accumulation,
             "background": background,
-            "intrinsic_color_render": rgb.clone(),
-            "intrinsic_color_render_raw": rgb.clone(),
-            "intrinsic_visibility": torch.ones_like(accumulation),
-            "water_accumulation": accumulation.clone(),
-            "rendered_null_probability": accumulation.clone(),
-            "rendered_scene_probability": torch.ones_like(accumulation),
+            "intrinsic_color_render": black,
+            "intrinsic_color_render_raw": black.clone(),
+            "intrinsic_visibility": accumulation.clone(),
+            "water_accumulation": freewater,
+            "rendered_null_probability": freewater.clone(),
+            "rendered_scene_probability": accumulation.clone(),
             "rendered_haze_probability": accumulation.clone(),
             "water_background_image": water_background_image,
             "background_backscatter_coefficients": water_coefficients.clone(),
             "background_attenuation_coefficients": water_coefficients.clone(),
+            "direct_transmittance": torch.ones_like(rgb),
+            "optical_depth": accumulation.clone(),
             "water_calibration_ambient_delta": water_coefficients.clone(),
             "water_calibration_backscatter_delta": water_coefficients.clone(),
             "water_calibration_attenuation_delta": water_coefficients.clone(),
-            "responsibility_freewater": accumulation.clone(),
+            "responsibility_freewater": freewater.clone(),
             "responsibility_haze": accumulation.clone(),
-            "responsibility_scene": torch.ones_like(accumulation),
+            "responsibility_scene": accumulation.clone(),
             "responsibility_uncertainty": accumulation.clone(),
         }
 
@@ -2714,6 +3012,181 @@ class SeaFreeGsModel(Model):
         )
         return ambient_light_colors, backscatter_coefficients, attenuation_coefficients, calibration_delta
 
+    def _get_outputs_nextgen(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
+        """Render compositing-exact underwater and clean radiance in one pass."""
+        if not isinstance(camera, Cameras):
+            print("Called get_outputs with not a camera")
+            return {}
+        if self.training:
+            assert camera.shape[0] == 1, "Only one camera at a time"
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
+        else:
+            optimized_camera_to_world = camera.camera_to_worlds
+
+        if self._uses_surface_carrier():
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
+            carrier_probability = self.surface_carrier.probability().detach()
+        else:
+            carrier_probability = torch.ones(
+                self.num_points, device=self.means.device, dtype=self.means.dtype
+            )
+
+        if self.crop_box is not None and not self.training:
+            crop_ids = self.crop_box.within(self.means).squeeze()
+            if crop_ids.sum() == 0:
+                return self.get_empty_outputs(
+                    int(camera.width.item()),
+                    int(camera.height.item()),
+                    self.background_color.to(self.device),
+                )
+        else:
+            crop_ids = None
+
+        if crop_ids is not None:
+            means = self.means[crop_ids]
+            scales = self.scales[crop_ids]
+            quats = self.quats[crop_ids]
+            opacities = self.opacities[crop_ids]
+            features_dc = self.features_dc[crop_ids]
+            features_rest = self.features_rest[crop_ids]
+            carrier_probability = carrier_probability[crop_ids]
+        else:
+            means = self.means
+            scales = self.scales
+            quats = self.quats
+            opacities = self.opacities
+            features_dc = self.features_dc
+            features_rest = self.features_rest
+
+        colors = torch.cat((features_dc[:, None, :], features_rest), dim=1)
+        if self.config.sh_degree > 0:
+            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+        else:
+            colors = torch.sigmoid(colors).squeeze(1)
+            sh_degree_to_use = None
+
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        intrinsics = camera.get_intrinsics_matrices().to(self.device)
+        width, height = int(camera.width.item()), int(camera.height.item())
+        self.last_size = (height, width)
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+
+        if self.config.rasterize_mode not in ["antialiased", "classic"]:
+            raise ValueError(f"Unknown rasterize_mode: {self.config.rasterize_mode}")
+
+        camera_to_world = torch.inverse(viewmat)
+        water_background = self.path_integrated_renderer.render_background(
+            height=height,
+            width=width,
+            intrinsics=intrinsics,
+            camera_to_world=camera_to_world,
+            dtype=means.dtype,
+        )
+        raw_opacity = torch.sigmoid(opacities).squeeze(-1)
+        effective_opacity = raw_opacity * carrier_probability
+        # Training losses and metrics only consume underwater RGB, depth, and
+        # alpha. Evaluation still composites both radiance layers exactly.
+        render_intrinsic = not self.training
+
+        def transform_colors(**projection) -> torch.Tensor:
+            return self.path_integrated_renderer.transform_projected_colors(
+                intrinsic_colors=projection["colors"],
+                means=means,
+                camera_to_world=camera_to_world,
+                radii=projection["radii"],
+                camera_ids=projection["camera_ids"],
+                gaussian_ids=projection["gaussian_ids"],
+                include_intrinsic=render_intrinsic,
+            )
+
+        render, alpha, self.info = rasterization(
+            means=means,
+            quats=quats,
+            scales=torch.exp(scales),
+            opacities=effective_opacity,
+            colors=colors,
+            viewmats=viewmat,
+            Ks=intrinsics,
+            width=width,
+            height=height,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode="RGB+ED",
+            sh_degree=sh_degree_to_use,
+            sparse_grad=False,
+            absgrad=self.strategy.absgrad,
+            rasterize_mode=self.config.rasterize_mode,
+            color_transform=transform_colors,
+            collect_contributions=False,
+        )
+        if self.training:
+            self.strategy.step_pre_backward(
+                self.gauss_params,
+                self.optimizers,
+                self.strategy_state,
+                self.step,
+                self.info,
+            )
+
+        rendered_underwater = render[..., :3]
+        if render_intrinsic:
+            intrinsic = render[..., 3:6].clamp(0.0, 1.0)
+        else:
+            # Preserve the output contract without retaining an unused raster
+            # graph during training. Clear renders are produced in eval mode.
+            intrinsic = torch.zeros_like(rendered_underwater)
+        expected_depth = render[..., -1:]
+        rgb = (
+            rendered_underwater
+            + (1.0 - alpha) * water_background["backscatter_radiance"]
+        ).clamp(0.0, 1.0)
+        transport_diagnostics = self.path_integrated_renderer.diagnostics(
+            expected_depth=expected_depth,
+            alpha=alpha,
+            background=water_background,
+        )
+        if self.config.use_bilateral_grid and self.training:
+            if camera.metadata is not None and "cam_idx" in camera.metadata:
+                rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], height, width)
+
+        far_depth = self.config.water_transport_depth_scale * self.config.water_transport_far_distance
+        depth = torch.where(
+            alpha > 1e-5,
+            torch.nan_to_num(expected_depth, nan=far_depth, posinf=far_depth, neginf=0.0),
+            torch.full_like(expected_depth, far_depth),
+        ).squeeze(0)
+        background = self._get_background_color()
+        if background.shape[0] == 3 and not self.training:
+            background = background.expand(height, width, 3)
+
+        zeros_rgb = torch.zeros_like(water_background["ambient"])
+        water_probability = (1.0 - alpha).clamp(0.0, 1.0)
+        self._last_carrier_camera_origin = camera_to_world[0, :3, 3].detach()
+        return {
+            "rgb": rgb.squeeze(0),
+            "depth": depth,
+            "accumulation": alpha.squeeze(0),
+            "background": background,
+            "intrinsic_color_render": intrinsic.squeeze(0),
+            "intrinsic_color_render_raw": intrinsic.squeeze(0),
+            "intrinsic_visibility": alpha.squeeze(0),
+            "water_accumulation": water_probability.squeeze(0),
+            "rendered_null_probability": water_probability.squeeze(0),
+            "rendered_scene_probability": alpha.squeeze(0),
+            "rendered_haze_probability": torch.zeros_like(alpha.squeeze(0)),
+            "water_background_image": water_background["backscatter_radiance"].squeeze(0),
+            "background_backscatter_coefficients": water_background["backscatter"].squeeze(0),
+            "background_attenuation_coefficients": water_background["attenuation"].squeeze(0),
+            "direct_transmittance": transport_diagnostics["direct_transmittance"].squeeze(0),
+            "optical_depth": transport_diagnostics["optical_depth"].squeeze(0),
+            "water_calibration_ambient_delta": zeros_rgb.squeeze(0),
+            "water_calibration_backscatter_delta": zeros_rgb.squeeze(0),
+            "water_calibration_attenuation_delta": zeros_rgb.squeeze(0),
+        }
+
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
@@ -2724,6 +3197,8 @@ class SeaFreeGsModel(Model):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        if self._uses_nextgen_water_model():
+            return self._get_outputs_nextgen(camera)
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -2759,7 +3234,8 @@ class SeaFreeGsModel(Model):
             scales_crop = self.scales
             quats_crop = self.quats
 
-        if self.config.enable_water_null_occupancy:
+        direct_carrier_clear = self._uses_surface_carrier()
+        if self.config.enable_water_null_occupancy and not direct_carrier_clear:
             (
                 gaussian_freewater_scores,
                 gaussian_scene_scores,
@@ -2769,14 +3245,31 @@ class SeaFreeGsModel(Model):
             gaussian_freewater_scores = torch.zeros_like(self.opacities)
             gaussian_scene_scores = torch.ones_like(self.opacities)
             gaussian_haze_scores = torch.zeros_like(self.opacities)
+        if direct_carrier_clear:
+            self.surface_carrier.sync_from_strategy_state(self.strategy_state)
+            carrier_render_weights = self.surface_carrier.render_weights()
+            underwater_geometry_gate = carrier_render_weights["underwater_geometry"].unsqueeze(-1)
+            clear_scene_gate = carrier_render_weights["clear_scene"].unsqueeze(-1)
+            transport_confidence = carrier_render_weights["transport_confidence"].unsqueeze(-1)
+        else:
+            carrier_render_weights = None
+            underwater_geometry_gate = torch.ones_like(self.opacities)
+            clear_scene_gate = torch.ones_like(self.opacities)
+            transport_confidence = torch.zeros_like(self.opacities)
         if crop_ids is not None:
             gaussian_freewater_scores_crop = gaussian_freewater_scores[crop_ids]
             gaussian_scene_scores_crop = gaussian_scene_scores[crop_ids]
             gaussian_haze_scores_crop = gaussian_haze_scores[crop_ids]
+            underwater_geometry_gate_crop = underwater_geometry_gate[crop_ids]
+            clear_scene_gate_crop = clear_scene_gate[crop_ids]
+            transport_confidence_crop = transport_confidence[crop_ids]
         else:
             gaussian_freewater_scores_crop = gaussian_freewater_scores
             gaussian_scene_scores_crop = gaussian_scene_scores
             gaussian_haze_scores_crop = gaussian_haze_scores
+            underwater_geometry_gate_crop = underwater_geometry_gate
+            clear_scene_gate_crop = clear_scene_gate
+            transport_confidence_crop = transport_confidence
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
@@ -2803,19 +3296,36 @@ class SeaFreeGsModel(Model):
             colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
             sh_degree_to_use = None
         
-        # Compute Gaussian colors after applying the water degradation model.
+        # Query the validated WPP for the image background. Gaussian properties
+        # are queried after projection/SH evaluation by color_transform below.
         camtoworlds = torch.inverse(viewmat)  # [C, 4, 4]
-        gaussian_line_of_sight_vectors = means_crop[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
-        gaussian_line_of_sight_vectors = gaussian_line_of_sight_vectors.detach()
-        gaussian_line_of_sight_vectors = gaussian_line_of_sight_vectors[0, :, :]  # [C, N, 3] -> [N, 3]
-        epsilon = 1e-8
-        gaussian_line_of_sight_distances = torch.norm(gaussian_line_of_sight_vectors, dim=1, keepdim=True)  # [N, 1]
-        gaussian_line_of_sight_directions = gaussian_line_of_sight_vectors / (gaussian_line_of_sight_distances + epsilon)  # [N, 3]
-        gaussian_count = gaussian_line_of_sight_directions.shape[0]
 
-        # Query the Water Properties Predictor for Gaussian and pixel LOS directions.
-        y = torch.linspace(0.0, H, H, device=self.device)
-        x = torch.linspace(0.0, W, W, device=self.device)
+        def _query_base_water_properties(
+            directions: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            if directions.numel() == 0:
+                empty = directions.new_zeros((0, 3))
+                return empty, empty, empty, directions.new_zeros((0, 9))
+            encoded = self.line_of_sight_direction_encoding(directions)
+            if self.config.mlp_type == "tcnn":
+                raw = self.water_properties_predictor(encoded)
+            else:
+                raw = self.water_properties_predictor(encoded.float())
+            calibration_raw = None
+            if self.config.enable_water_formation_calibrator:
+                calibration_raw = self.water_formation_calibrator(encoded)
+            ambient = self.ambient_light_activation(raw[..., :3])
+            backscatter = self.water_coefficient_activation(raw[..., 3:6])
+            attenuation = self.water_coefficient_activation(raw[..., 6:9])
+            return self._apply_water_formation_calibration(
+                ambient,
+                backscatter,
+                attenuation,
+                calibration_raw,
+            )
+
+        y = torch.arange(H, device=self.device, dtype=K.dtype) + 0.5
+        x = torch.arange(W, device=self.device, dtype=K.dtype) + 0.5
         xx, yy = torch.meshgrid(x, y, indexing="xy")
         cx = K[0, 0, 2]
         cy = K[0, 1, 2]
@@ -2830,94 +3340,108 @@ class SeaFreeGsModel(Model):
         pixel_line_of_sight_directions = pixel_line_of_sight_directions @ R.T
         image_shape = pixel_line_of_sight_directions.shape[:-1]
         pixel_line_of_sight_directions_flat = pixel_line_of_sight_directions.view(-1, 3)
-
-        directions_concatenated = torch.cat((gaussian_line_of_sight_directions, pixel_line_of_sight_directions_flat), dim=0)
-        encoded_line_of_sight_directions = self.line_of_sight_direction_encoding(directions_concatenated)
-
-        if self.config.mlp_type == "tcnn":
-            water_properties_raw = self.water_properties_predictor(encoded_line_of_sight_directions)
-        else:
-            water_properties_raw = self.water_properties_predictor(encoded_line_of_sight_directions.float())
-
-        calibration_raw = None
-        if self.config.enable_water_formation_calibrator:
-            calibration_raw = self.water_formation_calibrator(encoded_line_of_sight_directions)
-
-        # The Water Properties Predictor outputs ambient light A, backscatter beta^B,
-        # and attenuation beta^D for each queried LOS direction. The calibrator
-        # applies small physical residuals before image formation, not 2D RGB edits.
-        ambient_light_colors = self.ambient_light_activation(water_properties_raw[..., :3])
-        backscatter_coefficients = self.water_coefficient_activation(water_properties_raw[..., 3:6])
-        attenuation_coefficients = self.water_coefficient_activation(water_properties_raw[..., 6:9])
         (
-            ambient_light_colors,
-            backscatter_coefficients,
-            attenuation_coefficients,
-            water_calibration_delta,
-        ) = self._apply_water_formation_calibration(
-            ambient_light_colors,
-            backscatter_coefficients,
-            attenuation_coefficients,
-            calibration_raw,
+            pixel_ambient_light_colors,
+            pixel_backscatter_coefficients,
+            pixel_attenuation_coefficients,
+            pixel_water_calibration_delta,
+        ) = _query_base_water_properties(pixel_line_of_sight_directions_flat)
+        pixel_ambient_light_colors = pixel_ambient_light_colors.view(*image_shape, 3)
+        pixel_backscatter_coefficients = pixel_backscatter_coefficients.view(*image_shape, 3)
+        pixel_attenuation_coefficients = pixel_attenuation_coefficients.view(*image_shape, 3)
+        pixel_water_calibration_delta = pixel_water_calibration_delta.view(*image_shape, 9)
+        field_enabled = (
+            self.config.enable_path_integrated_transport
+            and self.step >= self.config.water_field_start_step
+        )
+        observe_medium = (
+            self.training
+            and self.config.water_field_start_step <= self.step < self.config.water_field_freeze_step
+            and self.step % self.config.carrier_update_every == 0
         )
 
-        gaussian_ambient_light_colors = ambient_light_colors[:gaussian_count].to(gaussian_line_of_sight_directions)
-        gaussian_backscatter_coefficients = backscatter_coefficients[:gaussian_count].to(gaussian_line_of_sight_directions)
-        gaussian_attenuation_coefficients = attenuation_coefficients[:gaussian_count].to(gaussian_line_of_sight_directions)
+        def _projection_water_transform(**projection) -> torch.Tensor:
+            intrinsic_colors = projection["colors"]
+            radii = projection["radii"]
+            if projection.get("camera_ids") is not None or projection.get("gaussian_ids") is not None:
+                raise NotImplementedError("Packed SeaFree transport is not supported")
+            transformed = []
+            depth_scale = max(float(self.config.water_transport_depth_scale), 1e-4)
+            for camera_index in range(intrinsic_colors.shape[0]):
+                intrinsic = intrinsic_colors[camera_index]
+                visible_ids = torch.where(radii[camera_index] > 0)[0]
+                degraded = intrinsic.clone()
+                if visible_ids.numel() > 0:
+                    origin = camtoworlds[camera_index, :3, 3].detach().to(means_crop)
+                    positions = means_crop[visible_ids].detach()
+                    vectors = positions - origin
+                    distances = torch.linalg.vector_norm(vectors, dim=-1).clamp_min(1e-5)
+                    directions = vectors / distances[:, None]
+                    ambient, backscatter, attenuation, _ = _query_base_water_properties(
+                        directions
+                    )
+                    if field_enabled:
+                        path = self.path_integrated_renderer.integrate_base_paths(
+                            ambient=ambient,
+                            backscatter=backscatter,
+                            attenuation=attenuation,
+                            origins=origin,
+                            directions=directions,
+                            distances=distances,
+                            spatial_gate=transport_confidence_crop[visible_ids, 0].detach(),
+                            observe_medium=observe_medium,
+                        )
+                        direct = path["direct_transmittance"]
+                        backscatter_radiance = path["backscatter_radiance"]
+                    else:
+                        normalized_distance = (distances / depth_scale).clamp(
+                            0.0, float(self.config.water_transport_far_distance)
+                        )[:, None]
+                        direct = torch.exp(-attenuation * normalized_distance)
+                        backscatter_radiance = ambient * (
+                            1.0 - torch.exp(-backscatter * normalized_distance)
+                        )
+                    degraded_visible = intrinsic[visible_ids] * direct + backscatter_radiance
+                    degraded = degraded.index_copy(0, visible_ids, degraded_visible)
 
-        pixel_ambient_light_colors = ambient_light_colors[gaussian_count:].view(*image_shape, -1).to(gaussian_line_of_sight_directions)
-        pixel_backscatter_coefficients = backscatter_coefficients[gaussian_count:].view(*image_shape, -1).to(gaussian_line_of_sight_directions)
-        pixel_attenuation_coefficients = attenuation_coefficients[gaussian_count:].view(*image_shape, -1).to(gaussian_line_of_sight_directions)
-        pixel_water_calibration_delta = water_calibration_delta[gaussian_count:].view(*image_shape, -1).to(gaussian_line_of_sight_directions)
+                def responsibility_channel(channel: torch.Tensor) -> torch.Tensor:
+                    value = channel.to(intrinsic)
+                    if value.dim() == 1:
+                        value = value[:, None]
+                    return value
 
-        normalized_gaussian_line_of_sight_distances = gaussian_line_of_sight_distances / 10  # 10 is depth_scale_factor.
-        gaussian_attenuation_transmittance = torch.exp(
-            -gaussian_attenuation_coefficients * normalized_gaussian_line_of_sight_distances
+                channels = [degraded, intrinsic]
+                if not direct_carrier_clear:
+                    channels.extend(
+                        [
+                            responsibility_channel(gaussian_freewater_scores_crop),
+                            responsibility_channel(gaussian_scene_scores_crop),
+                            responsibility_channel(gaussian_haze_scores_crop),
+                        ]
+                    )
+                transformed.append(torch.cat(channels, dim=-1))
+            return torch.stack(transformed, dim=0)
+
+        background_transport = self.path_integrated_renderer.integrate_background_from_base(
+            ambient=pixel_ambient_light_colors,
+            backscatter=pixel_backscatter_coefficients,
+            attenuation=pixel_attenuation_coefficients,
+            directions=pixel_line_of_sight_directions,
+            camera_origin=camtoworlds[0, :3, 3].detach(),
+            enabled=field_enabled,
         )
-        gaussian_backscatter_transmittance = torch.exp(
-            -gaussian_backscatter_coefficients * normalized_gaussian_line_of_sight_distances
-        )
-        gaussian_ambient_for_render = gaussian_ambient_light_colors
-        if colors_crop.dim() == 3:
-            # SH rendering stores per-basis coefficients as [N, basis, C].  The
-            # water formation terms are per-Gaussian RGB values and therefore
-            # need an explicit basis dimension before broadcasting.
-            gaussian_attenuation_transmittance = gaussian_attenuation_transmittance[:, None, :]
-            gaussian_backscatter_transmittance = gaussian_backscatter_transmittance[:, None, :]
-            gaussian_ambient_for_render = gaussian_ambient_for_render[:, None, :]
-        degraded_gaussian_colors = colors_crop * gaussian_attenuation_transmittance + gaussian_ambient_for_render * (
-            1 - gaussian_backscatter_transmittance
-        )
-
-        def _format_gaussian_responsibility_channel(channel: torch.Tensor) -> torch.Tensor:
-            channel = channel.to(colors_crop)
-            if channel.dim() == 1:
-                channel = channel[:, None]
-            if colors_crop.dim() == 3:
-                return channel[:, None, :].expand(-1, colors_crop.shape[1], -1)
-            return channel
-
-        colors_crop = torch.cat(
-            (
-                degraded_gaussian_colors,
-                colors_crop,
-                _format_gaussian_responsibility_channel(gaussian_freewater_scores_crop),
-                _format_gaussian_responsibility_channel(gaussian_scene_scores_crop),
-                _format_gaussian_responsibility_channel(gaussian_haze_scores_crop),
-            ),
-            dim=-1,
-        )
-
-        water_background_image = pixel_ambient_light_colors
-        background_attenuation_coefficients = pixel_attenuation_coefficients
-        background_backscatter_coefficients = pixel_backscatter_coefficients
+        water_background_image = background_transport["backscatter_radiance"]
+        background_attenuation_coefficients = background_transport["attenuation"]
+        background_backscatter_coefficients = background_transport["backscatter"]
 
         # render [C,H,W,D] alpha [1,H,W,1]
         render, alpha, self.info = rasterization(
             means=means_crop,
             quats=quats_crop,  # rasterization does normalization internally
             scales=torch.exp(scales_crop),
-            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            opacities=(
+                torch.sigmoid(opacities_crop) * underwater_geometry_gate_crop
+            ).squeeze(-1),
             colors=colors_crop,
             viewmats=viewmat,  # [1, 4, 4]
             Ks=K,  # [1, 3, 3]
@@ -2931,6 +3455,8 @@ class SeaFreeGsModel(Model):
             sparse_grad=False,
             absgrad=self.strategy.absgrad,
             rasterize_mode=self.config.rasterize_mode,
+            color_transform=_projection_water_transform,
+            collect_contributions=False,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
@@ -2945,21 +3471,70 @@ class SeaFreeGsModel(Model):
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
         intrinsic_color_render_raw = torch.clamp(render[:, ..., 3:6], 0.0, 1.0)
-        water_accumulation = render[:, ..., 6:7].clamp(0.0, 1.0)
-        scene_accumulation = render[:, ..., 7:8].clamp(0.0, 1.0)
-        haze_accumulation = render[:, ..., 8:9].clamp(0.0, 1.0)
-        rendered_null_probability = (water_accumulation / alpha.clamp_min(1e-6)).clamp(0.0, 1.0)
-        rendered_scene_probability = (scene_accumulation / alpha.clamp_min(1e-6)).clamp(0.0, 1.0)
-        rendered_haze_probability = (haze_accumulation / alpha.clamp_min(1e-6)).clamp(0.0, 1.0)
-        intrinsic_visibility = self._build_intrinsic_visibility_gate(
-            alpha,
-            rendered_null_probability,
-            water_accumulation,
-            responsibility_freewater=rendered_null_probability,
-            responsibility_scene=rendered_scene_probability,
-            responsibility_haze=rendered_haze_probability,
-        )
-        intrinsic_color_render_clamped = intrinsic_color_render_raw * intrinsic_visibility
+        carrier_clear_render = None
+        if direct_carrier_clear and not self.training:
+            # A separate opacity stream is required for correct clear-view
+            # transmittance. Reusing underwater alpha would leave medium splats
+            # as black occluders in front of real surfaces. This extra raster is
+            # evaluation-only and therefore does not change training time/memory.
+            with torch.no_grad():
+                clear_render, _, _ = rasterization(
+                    means=means_crop,
+                    quats=quats_crop,
+                    scales=torch.exp(scales_crop),
+                    opacities=(
+                        torch.sigmoid(opacities_crop) * clear_scene_gate_crop
+                    ).squeeze(-1),
+                    colors=colors_crop,
+                    viewmats=viewmat,
+                    Ks=K,
+                    width=W,
+                    height=H,
+                    packed=False,
+                    near_plane=0.01,
+                    far_plane=1e10,
+                    render_mode="RGB",
+                    sh_degree=sh_degree_to_use,
+                    sparse_grad=False,
+                    absgrad=False,
+                    rasterize_mode=self.config.rasterize_mode,
+                )
+                carrier_clear_render = clear_render[..., :3].clamp(0.0, 1.0)
+        if direct_carrier_clear:
+            water_accumulation = (1.0 - alpha).clamp(0.0, 1.0)
+            rendered_null_probability = water_accumulation
+            rendered_scene_probability = alpha.clamp(0.0, 1.0)
+            rendered_haze_probability = torch.zeros_like(alpha)
+            intrinsic_visibility = torch.ones_like(alpha)
+            intrinsic_color_render_clamped = (
+                carrier_clear_render
+                if carrier_clear_render is not None
+                else intrinsic_color_render_raw
+            )
+        else:
+            water_accumulation = render[:, ..., 6:7].clamp(0.0, 1.0)
+            scene_accumulation = render[:, ..., 7:8].clamp(0.0, 1.0)
+            haze_accumulation = render[:, ..., 8:9].clamp(0.0, 1.0)
+            rendered_null_probability = (
+                water_accumulation / alpha.clamp_min(1e-6)
+            ).clamp(0.0, 1.0)
+            rendered_scene_probability = (
+                scene_accumulation / alpha.clamp_min(1e-6)
+            ).clamp(0.0, 1.0)
+            rendered_haze_probability = (
+                haze_accumulation / alpha.clamp_min(1e-6)
+            ).clamp(0.0, 1.0)
+            intrinsic_visibility = self._build_intrinsic_visibility_gate(
+                alpha,
+                rendered_null_probability,
+                water_accumulation,
+                responsibility_freewater=rendered_null_probability,
+                responsibility_scene=rendered_scene_probability,
+                responsibility_haze=rendered_haze_probability,
+            )
+            intrinsic_color_render_clamped = (
+                intrinsic_color_render_raw * intrinsic_visibility
+            )
 
 
         if self.config.use_bilateral_grid and self.training:
@@ -3031,6 +3606,39 @@ class SeaFreeGsModel(Model):
         else:
             return image
 
+    def _get_metrics_dict_nextgen(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        gt_rgb = self.composite_with_background(
+            self.get_gt_img(batch["image"]), outputs["background"]
+        )
+        if self._uses_surface_carrier():
+            carrier_probability_mean = self.surface_carrier.probability().mean()
+            carrier_certified_fraction = self.surface_carrier.probabilities()[
+                "certified"
+            ].float().mean()
+        else:
+            carrier_probability_mean = torch.ones((), device=self.device)
+            carrier_certified_fraction = torch.zeros((), device=self.device)
+        metrics_dict: Dict[str, torch.Tensor] = {
+            "psnr": self.psnr(outputs["rgb"], gt_rgb),
+            "gaussian_count": torch.tensor(float(self.num_points), device=self.device),
+            "carrier_probability_mean": carrier_probability_mean,
+            "carrier_certified_fraction": carrier_certified_fraction,
+        }
+        if self.config.color_corrected_metrics:
+            metrics_dict["cc_psnr"] = self.psnr(color_correct(outputs["rgb"], gt_rgb), gt_rgb)
+        for channel in range(3):
+            attenuation = outputs["background_attenuation_coefficients"][..., channel]
+            backscatter = outputs["background_backscatter_coefficients"][..., channel]
+            ambient = outputs["water_background_image"][..., channel]
+            metrics_dict[f"background_attenuation_coefficient_{channel}_mean"] = attenuation.mean()
+            metrics_dict[f"background_backscatter_coefficient_{channel}_mean"] = backscatter.mean()
+            metrics_dict[f"water_background_color_{channel}_mean"] = ambient.mean()
+            metrics_dict[f"background_attenuation_coefficient_{channel}_max"] = attenuation.max()
+            metrics_dict[f"background_backscatter_coefficient_{channel}_max"] = backscatter.max()
+            metrics_dict[f"water_background_color_{channel}_max"] = ambient.max()
+        self.camera_optimizer.get_metrics_dict(metrics_dict)
+        return metrics_dict
+
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
 
@@ -3038,6 +3646,8 @@ class SeaFreeGsModel(Model):
             outputs: the output to compute loss dict to
             batch: ground truth batch corresponding to outputs
         """
+        if self._uses_nextgen_water_model():
+            return self._get_metrics_dict_nextgen(outputs, batch)
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         gt_depth = batch["depth_image"]
         gt_depth = gt_depth / gt_depth.max()
@@ -3052,7 +3662,6 @@ class SeaFreeGsModel(Model):
 
         metrics_dict["gaussian_count"] = self.num_points
         if self.config.enable_water_null_occupancy:
-            self._ensure_water_lifecycle_buffers()
             metrics_dict["water_null_probability_mean"] = self.last_water_probability_mean.to(self.device)
             metrics_dict["water_pure_probability_mean"] = self.last_water_pure_probability_mean.to(self.device)
             metrics_dict["water_transition_probability_mean"] = self.last_water_transition_probability_mean.to(self.device)
@@ -3073,14 +3682,16 @@ class SeaFreeGsModel(Model):
             metrics_dict["responsibility_scene_mean"] = self.last_responsibility_scene_mean.to(self.device)
             metrics_dict["responsibility_uncertainty_mean"] = self.last_responsibility_uncertainty_mean.to(self.device)
             metrics_dict["water_calibration_delta_mean"] = self.last_water_calibration_delta_mean.to(self.device)
-            metrics_dict["water_exposure_score_mean"] = self.strategy_state["water_exposure_score"].mean()
-            metrics_dict["scene_exposure_score_mean"] = self.strategy_state["scene_exposure_score"].mean()
-            metrics_dict["depth_edge_support_score_mean"] = self.strategy_state["depth_edge_support_score"].mean()
-            metrics_dict["color_residual_support_score_mean"] = self.strategy_state["color_residual_support_score"].mean()
-            metrics_dict["view_consistency_score_mean"] = self.strategy_state["view_consistency_score"].mean()
-            metrics_dict["empty_freewater_exposure_score_mean"] = self.strategy_state["empty_freewater_exposure_score"].mean()
-            metrics_dict["attached_veil_exposure_score_mean"] = self.strategy_state["attached_veil_exposure_score"].mean()
-            metrics_dict["scene_core_exposure_score_mean"] = self.strategy_state["scene_core_exposure_score"].mean()
+            if self._uses_legacy_water_lifecycle():
+                self._ensure_water_lifecycle_buffers()
+                metrics_dict["water_exposure_score_mean"] = self.strategy_state["water_exposure_score"].mean()
+                metrics_dict["scene_exposure_score_mean"] = self.strategy_state["scene_exposure_score"].mean()
+                metrics_dict["depth_edge_support_score_mean"] = self.strategy_state["depth_edge_support_score"].mean()
+                metrics_dict["color_residual_support_score_mean"] = self.strategy_state["color_residual_support_score"].mean()
+                metrics_dict["view_consistency_score_mean"] = self.strategy_state["view_consistency_score"].mean()
+                metrics_dict["empty_freewater_exposure_score_mean"] = self.strategy_state["empty_freewater_exposure_score"].mean()
+                metrics_dict["attached_veil_exposure_score_mean"] = self.strategy_state["attached_veil_exposure_score"].mean()
+                metrics_dict["scene_core_exposure_score_mean"] = self.strategy_state["scene_core_exposure_score"].mean()
             metrics_dict["water_no_grow_candidates"] = torch.tensor(
                 float(self.last_water_no_grow_candidates),
                 device=self.device,
@@ -3089,6 +3700,31 @@ class SeaFreeGsModel(Model):
                 float(self.last_water_prune_candidates),
                 device=self.device,
             )
+        if self._uses_surface_carrier():
+            carrier_ownership = self.surface_carrier.probabilities()
+            metrics_dict["carrier_freewater_mean"] = carrier_ownership["freewater"].mean()
+            metrics_dict["carrier_haze_mean"] = carrier_ownership["haze"].mean()
+            metrics_dict["carrier_scene_mean"] = carrier_ownership["scene"].mean()
+            metrics_dict["carrier_certified_fraction"] = carrier_ownership[
+                "certified"
+            ].float().mean()
+            metrics_dict["carrier_certified_medium_fraction"] = carrier_ownership[
+                "certified_medium"
+            ].float().mean()
+            metrics_dict["carrier_certified_surface_fraction"] = carrier_ownership[
+                "certified_surface"
+            ].float().mean()
+            metrics_dict["carrier_observation_mass_mean"] = (
+                self.surface_carrier.observation_mass.mean()
+            )
+            metrics_dict["carrier_epoch_distinct_views_mean"] = (
+                self.surface_carrier.distinct_views.float().mean()
+            )
+        if self.config.enable_path_integrated_transport:
+            field = self.path_integrated_renderer.field
+            metrics_dict["water_field_plane_abs_mean"] = field.planes.abs().mean()
+            metrics_dict["water_field_plane_abs_max"] = field.planes.abs().max()
+            metrics_dict["water_field_anchor_abs_mean"] = field.latent_running_mean.abs().mean()
 
         for i in range(3):
             metrics_dict[f"background_attenuation_coefficient_{i}_mean"] = outputs["background_attenuation_coefficients"][:, :, i].mean()
@@ -3122,6 +3758,102 @@ class SeaFreeGsModel(Model):
 
         ssim_values = [ssim_func(b1, b2) for b1, b2 in zip(blocks1, blocks2)]
         return torch.mean(torch.stack(ssim_values))
+
+    def _get_loss_dict_nextgen(self, outputs, batch) -> Dict[str, torch.Tensor]:
+        """Original SeaFree supervision on the compact, GPU-only forward path."""
+        gt_underwater = self.composite_with_background(
+            self.get_gt_img(batch["image"]), outputs["background"]
+        )
+        rendered_underwater = outputs["rgb"]
+        pseudo_depth = self._downscale_if_required(batch["depth_image"]).to(self.device)
+        pseudo_depth = pseudo_depth / pseudo_depth.amax().clamp_min(1e-6)
+        rendered_depth = outputs["depth"]
+        valid_image_mask = None
+
+        if "mask" in batch:
+            valid_image_mask = self._downscale_if_required(batch["mask"]).to(self.device)
+            assert valid_image_mask.shape[:2] == gt_underwater.shape[:2] == rendered_underwater.shape[:2]
+            gt_underwater = gt_underwater * valid_image_mask
+            rendered_underwater = rendered_underwater * valid_image_mask
+            pseudo_depth = pseudo_depth * valid_image_mask
+            if rendered_depth is not None:
+                rendered_depth = rendered_depth * valid_image_mask
+
+        foreground_mask = (pseudo_depth > 1e-2).to(pseudo_depth.dtype)
+        if foreground_mask.dim() == 2:
+            foreground_mask = foreground_mask.unsqueeze(-1)
+        background_mask = 1.0 - foreground_mask
+        background_fraction = background_mask.mean()
+
+        reconstruction_weight = 1.0 / (rendered_underwater.detach() + 1e-3)
+        reconstruction_weight = torch.where(
+            foreground_mask < 0.5,
+            torch.ones_like(reconstruction_weight),
+            reconstruction_weight,
+        )
+        weighted_l1 = torch.abs(
+            (gt_underwater - rendered_underwater) * reconstruction_weight
+        ).mean()
+        gt_chw = gt_underwater.permute(2, 0, 1).unsqueeze(0)
+        rendered_chw = rendered_underwater.permute(2, 0, 1).unsqueeze(0)
+        weight_chw = reconstruction_weight.permute(2, 0, 1).unsqueeze(0)
+        if gt_chw.shape[-1] > 800 or gt_chw.shape[-2] > 800:
+            weighted_dssim = 1.0 - self.split_and_calculate_ssim(
+                self.ssim, gt_chw * weight_chw, rendered_chw * weight_chw
+            )
+        else:
+            weighted_dssim = 1.0 - self.ssim(
+                gt_chw * weight_chw, rendered_chw * weight_chw
+            )
+
+        if self.config.use_scale_regularization:
+            scale_exp = torch.exp(self.scales)
+            scale_reg = (
+                torch.maximum(
+                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
+                    torch.tensor(self.config.max_gauss_ratio, device=self.device),
+                )
+                - self.config.max_gauss_ratio
+            )
+            if self.step < self.config.reset_alpha_every * self.config.refine_every + 200:
+                scale_reg = 0.1 * scale_reg.mean()
+            else:
+                scale_reg = 100.0 * scale_reg.mean()
+        else:
+            scale_reg = torch.zeros((), device=self.device)
+
+        depth_loss = torch.zeros((), device=self.device)
+        if self.config.enable_coarse_grained_depth_loss and rendered_depth is not None:
+            approximate_disparity = 1.0 / (rendered_depth.flatten() * 10.0 + 1.0)
+            depth_loss = 1.0 - pearson_corrcoef(pseudo_depth.flatten(), approximate_disparity)
+            depth_loss = torch.nan_to_num(depth_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+        background_supervision = torch.zeros((), device=self.device)
+        if self.config.enable_background_water_supervision and self.step < 15000:
+            ambient = outputs["water_background_image"]
+            ambient_weight = 1.0 / (ambient.detach() + 1e-3)
+            background_supervision = self._weighted_mean(
+                torch.abs((ambient - gt_underwater) * ambient_weight),
+                background_mask.expand_as(ambient),
+            )
+            background_supervision = background_supervision * (background_fraction > 0.05).to(
+                background_supervision.dtype
+            )
+
+        loss_dict = {
+            "content_based_reconstruction_loss": (
+                (1.0 - self.config.ssim_lambda) * weighted_l1
+                + self.config.ssim_lambda * weighted_dssim
+                + 0.01 * background_supervision
+            ),
+            "scale_regularization_loss": scale_reg,
+            "coarse_grained_depth_loss": 0.1 * depth_loss,
+        }
+        if self.training:
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            if self.config.use_bilateral_grid:
+                loss_dict["tv_loss"] = 10.0 * total_variation_loss(self.bil_grids.grids)
+        return loss_dict
     
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
@@ -3132,6 +3864,8 @@ class SeaFreeGsModel(Model):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
+        if self._uses_nextgen_water_model():
+            return self._get_loss_dict_nextgen(outputs, batch)
         gt_underwater_image = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         rendered_underwater_image = outputs["rgb"]
         render_mask = None
@@ -3236,15 +3970,29 @@ class SeaFreeGsModel(Model):
                 "water_calibration_delta_raw",
                 torch.zeros_like(outputs["water_background_image"]),
             ).abs().mean().detach()
+            rendered_error = torch.abs(
+                rendered_underwater_image.detach() - gt_underwater_image.detach()
+            ).mean(dim=-1, keepdim=True)
+            water_only_error = torch.abs(
+                outputs["water_background_image"].detach() - gt_underwater_image.detach()
+            ).mean(dim=-1, keepdim=True)
+            water_only_advantage = torch.sigmoid(
+                (rendered_error - water_only_error) / 0.04
+            )
             self._update_water_lifecycle_scores(
-                freewater_responsibility,
-                scene_responsibility,
-                haze_responsibility,
-                water_probabilities["depth_edge_support"],
-                water_probabilities["color_residual_support"],
-                water_probabilities["empty_freewater"],
-                water_probabilities["attached_veil"],
-                water_probabilities["scene_core"],
+                water_probability=freewater_responsibility,
+                scene_probability=scene_responsibility,
+                haze_probability=haze_responsibility,
+                depth_edge_support=water_probabilities["depth_edge_support"],
+                color_residual_support=water_probabilities["color_residual_support"],
+                empty_freewater_probability=water_probabilities["empty_freewater"],
+                attached_veil_probability=water_probabilities["attached_veil"],
+                scene_core_probability=water_probabilities["scene_core"],
+                water_similarity_probability=water_probabilities["water_anchor_similarity"],
+                low_structure_probability=water_probabilities["water_matte_low_structure"],
+                water_only_advantage=water_only_advantage,
+                view_id=torch.as_tensor(batch["image_idx"], device=self.device),
+                valid_image_mask=render_mask,
             )
         else:
             freewater_responsibility = torch.zeros_like(rendered_underwater_image[..., :1])
@@ -3307,22 +4055,37 @@ class SeaFreeGsModel(Model):
         
         background_water_supervision_loss = torch.tensor(0.0, device=self.device)
         if self.config.enable_background_water_supervision and self.step < 15000:
-            used_strict_water_background = False
+            strict_background_active = torch.zeros((), device=self.device)
             if self.config.enable_water_null_occupancy and strict_destructive_water_probability is not None:
-                if float((strict_destructive_water_probability > 0).float().mean().detach().cpu()) > 0.005:
-                    background_ambient_light_weight = 1 / (water_background_image.detach() + 1e-3)
-                    background_water_supervision_loss += self._weighted_mean(
-                        torch.abs((water_background_image - gt_underwater_image) * background_ambient_light_weight),
-                        strict_destructive_water_probability.repeat(1, 1, 3),
-                    )
-                    used_strict_water_background = True
-            if not used_strict_water_background and background_pixel_ratio > 0.05:
-                background_ambient_light_pixels = water_background_image[foreground_mask.repeat(1, 1, 3) < 0.5]
-                background_underwater_pixels = gt_underwater_image[foreground_mask.repeat(1, 1, 3) < 0.5]            
-                background_ambient_light_weight = 1 / (background_ambient_light_pixels.detach() + 1e-3)
-                background_water_supervision_loss += torch.abs(
-                    (background_ambient_light_pixels - background_underwater_pixels) * background_ambient_light_weight
-                ).mean()        
+                strict_background_active = (
+                    (strict_destructive_water_probability > 0).float().mean() > 0.005
+                ).to(water_background_image)
+                background_ambient_light_weight = 1 / (
+                    water_background_image.detach() + 1e-3
+                )
+                strict_background_loss = self._weighted_mean(
+                    torch.abs(
+                        (water_background_image - gt_underwater_image)
+                        * background_ambient_light_weight
+                    ),
+                    strict_destructive_water_probability.repeat(1, 1, 3),
+                )
+                background_water_supervision_loss += (
+                    strict_background_active * strict_background_loss
+                )
+            fallback_background_active = (
+                (background_pixel_ratio > 0.05).to(water_background_image)
+                * (1.0 - strict_background_active)
+            )
+            fallback_weight = (1.0 - foreground_mask).repeat(1, 1, 3)
+            fallback_background_loss = self._weighted_mean(
+                torch.abs(water_background_image - gt_underwater_image)
+                / (water_background_image.detach() + 1e-3),
+                fallback_weight,
+            )
+            background_water_supervision_loss += (
+                fallback_background_active * fallback_background_loss
+            )
 
         water_empty_occupancy_loss = torch.tensor(0.0, device=self.device)
         water_transition_alpha_loss = torch.tensor(0.0, device=self.device)
@@ -3538,6 +4301,67 @@ class SeaFreeGsModel(Model):
         outs = self.get_outputs(camera.to(self.device))
         return outs  # type: ignore
 
+    def _get_image_metrics_and_images_nextgen(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        """Evaluate without conditioning the clean render on test RGB or depth."""
+        gt_rgb_hwc = self.composite_with_background(
+            self.get_gt_img(batch["image"]), outputs["background"]
+        )
+        predicted_hwc = outputs["rgb"]
+        combined_rgb = torch.cat([gt_rgb_hwc, predicted_hwc], dim=1)
+        gt_rgb = gt_rgb_hwc.permute(2, 0, 1).unsqueeze(0)
+        predicted_rgb = predicted_hwc.permute(2, 0, 1).unsqueeze(0)
+
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        if gt_rgb.shape[-1] > 800 or gt_rgb.shape[-2] > 800:
+            ssim = self.split_and_calculate_ssim(self.ssim, gt_rgb, predicted_rgb)
+        else:
+            ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
+        metrics_dict = {
+            "psnr": float(psnr.item()),
+            "ssim": float(ssim),
+            "lpips": float(lpips),
+        }
+
+        if self.config.color_corrected_metrics:
+            corrected = color_correct(predicted_hwc, gt_rgb_hwc).permute(2, 0, 1).unsqueeze(0)
+            cc_psnr = self.psnr(gt_rgb, corrected)
+            if gt_rgb.shape[-1] > 800 or gt_rgb.shape[-2] > 800:
+                cc_ssim = self.split_and_calculate_ssim(self.ssim, gt_rgb, corrected)
+            else:
+                cc_ssim = self.ssim(gt_rgb, corrected)
+            metrics_dict["cc_psnr"] = float(cc_psnr.item())
+            metrics_dict["cc_ssim"] = float(cc_ssim)
+            metrics_dict["cc_lpips"] = float(self.lpips(gt_rgb, corrected))
+
+        gt_depth = batch["depth_image"].to(self.device)
+        gt_depth = gt_depth / gt_depth.amax().clamp_min(1e-6)
+        depth = outputs["depth"]
+        depth_normalized = depth / depth.amax().clamp_min(1e-6)
+        far_distance = max(float(self.config.water_transport_far_distance), 1e-6)
+        images_dict = {
+            "img": combined_rgb,
+            "accumulation": outputs["accumulation"],
+            "intrinsic_color_render": outputs["intrinsic_color_render"],
+            "intrinsic_color_render_raw": outputs["intrinsic_color_render_raw"],
+            "intrinsic_visibility": outputs["intrinsic_visibility"],
+            "rendered_underwater_image": predicted_hwc,
+            "water_background_image": outputs["water_background_image"],
+            "background_backscatter_coefficients": outputs[
+                "background_backscatter_coefficients"
+            ].clamp(0.0, 1.0),
+            "background_attenuation_coefficients": outputs[
+                "background_attenuation_coefficients"
+            ].clamp(0.0, 1.0),
+            "direct_transmittance": outputs["direct_transmittance"],
+            "optical_depth": (outputs["optical_depth"] / far_distance).clamp(0.0, 1.0),
+            "depth_GT": gt_depth,
+            "depth_ED": depth_normalized,
+        }
+        return metrics_dict, images_dict
+
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
@@ -3552,6 +4376,8 @@ class SeaFreeGsModel(Model):
         Returns:
             A dictionary of metrics.
         """
+        if self._uses_nextgen_water_model():
+            return self._get_image_metrics_and_images_nextgen(outputs, batch)
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         gt_rgb_image = gt_rgb
         gt_depth = batch["depth_image"]
@@ -3694,7 +4520,8 @@ class SeaFreeGsModel(Model):
                 outputs["water_background_image"],
                 eval_water_probabilities,
             )
-            intrinsic_clean = layered_clean_outputs["clean"]
+            if not self._uses_surface_carrier():
+                intrinsic_clean = layered_clean_outputs["clean"]
             images_dict['intrinsic_visibility'] = eval_intrinsic_visibility
             images_dict['layered_deveiled_intrinsic_color_render'] = layered_clean_outputs["deveiled"]
             images_dict['layered_veil_blend'] = layered_clean_outputs["veil_blend"]

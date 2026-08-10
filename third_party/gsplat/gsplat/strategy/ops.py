@@ -10,6 +10,15 @@ from gsplat.relocation import compute_relocation
 from gsplat.utils import normalized_quat_to_rotmat
 
 
+def _carrier_child_state(name: str, parent: Tensor) -> Tensor:
+    """Reset ownership evidence after a Gaussian changes spatial support."""
+    if name == "carrier_sfm_reliability":
+        return (parent.to(torch.float32) * 0.75).round().to(parent.dtype)
+    if name in ("carrier_medium_evidence", "carrier_surface_evidence"):
+        return torch.ones_like(parent)
+    return torch.zeros_like(parent)
+
+
 @torch.no_grad()
 def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Tensor:
     """Sample from a distribution using torch.multinomial or numpy.random.choice.
@@ -117,7 +126,11 @@ def duplicate(
     # update the extra running state
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
-            state[k] = torch.cat((v, v[sel]))
+            if k.startswith("carrier_"):
+                child = _carrier_child_state(k, v[sel])
+            else:
+                child = v[sel]
+            state[k] = torch.cat((v, child))
 
 
 @torch.no_grad()
@@ -177,6 +190,8 @@ def split(
         if isinstance(v, torch.Tensor):
             repeats = [2] + [1] * (v.dim() - 1)
             v_new = v[sel].repeat(repeats)
+            if k.startswith("carrier_"):
+                v_new = _carrier_child_state(k, v_new)
             state[k] = torch.cat((v[rest], v_new))
 
 
