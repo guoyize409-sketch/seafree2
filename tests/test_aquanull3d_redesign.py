@@ -107,7 +107,85 @@ def test_exact_mass_and_repeated_view_accounting():
     carrier.update_from_responsibilities(step=0, view_id=torch.tensor(7, device=device), **kwargs)
     carrier.update_from_responsibilities(step=1, view_id=torch.tensor(7, device=device), **kwargs)
     assert int(carrier.distinct_views.max()) == 1
-    assert torch.all(carrier.epoch_medium > carrier.epoch_surface)
+    assert torch.all(carrier.window_medium_evidence > carrier.window_surface_evidence)
+    torch.testing.assert_close(carrier.medium_evidence, carrier.surface_evidence)
+    carrier.update_from_responsibilities(step=2, view_id=torch.tensor(8, device=device), **kwargs)
+    carrier.update_from_responsibilities(step=20, view_id=torch.tensor(9, device=device), **kwargs)
+    assert torch.all(carrier.medium_evidence > carrier.surface_evidence)
+
+
+def test_real_view_ids_are_deduplicated_and_parallax_is_recorded():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    carrier = SurfaceCarrierField(
+        1,
+        device,
+        update_every=1,
+        min_distinct_views=2,
+        warmup_steps=0,
+        epoch_steps=20,
+    )
+    info = _projection_info(device, 1)
+    means = torch.zeros(1, 3, device=device)
+    camera_origins = (
+        torch.tensor([-1.0, 0.0, 0.0], device=device),
+        torch.tensor([0.0, -1.0, 0.0], device=device),
+        torch.tensor([1.0, 0.0, 0.0], device=device),
+        torch.tensor([0.0, 1.0, 0.0], device=device),
+    )
+    for step, camera_origin in enumerate(camera_origins):
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(3, device=device),
+            info=info,
+            responsibility_mass=_mass(device, 1, 0),
+            means=means,
+            camera_origin=camera_origin,
+        )
+    assert int(carrier.angular_coverage[0]) == 1
+
+    distinct = SurfaceCarrierField(
+        1,
+        device,
+        update_every=1,
+        min_distinct_views=2,
+        warmup_steps=0,
+        epoch_steps=20,
+    )
+    for step in range(4):
+        distinct.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(step, device=device),
+            info=info,
+            responsibility_mass=_mass(device, 1, 0),
+            means=means,
+            camera_origin=camera_origins[step],
+        )
+    assert int(distinct.angular_coverage[0]) == 4
+    assert float(distinct.parallax_evidence[0]) > 0.0
+
+
+def test_continuous_carrier_split_is_conservative_and_exact_at_certification():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    carrier = SurfaceCarrierField(3, device, warmup_steps=0, min_distinct_views=2)
+    carrier.medium_evidence.copy_(torch.tensor([0.55, 0.50, 0.95], device=device))
+    carrier.surface_evidence.copy_(torch.tensor([0.45, 0.50, 0.05], device=device))
+    carrier.observation_mass.fill_(4.0)
+    carrier.lifetime_coverage.fill_(3)
+    weights = carrier.render_weights()
+    torch.testing.assert_close(
+        weights["surface_fraction"] + weights["medium_fraction"],
+        torch.ones(3, device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert 0.0 < float(weights["medium_fraction"][0]) < 1.0
+    assert 0.0 < float(weights["surface_fraction"][0]) < 1.0
+
+    carrier.certified_state[2] = carrier.MEDIUM
+    certified = carrier.render_weights()
+    assert float(certified["clear_scene"][2]) == 0.0
+    assert float(certified["medium_fraction"][2]) == 1.0
+    assert float(certified["underwater_geometry"][2]) == 1.0
 
 
 def test_contradictory_epoch_returns_to_uncertain_before_recertification():
@@ -134,6 +212,100 @@ def test_contradictory_epoch_returns_to_uncertain_before_recertification():
             responsibility_mass=_mass(device, count, 1),
         )
     assert not bool(carrier.render_weights()["certified"].any())
+    for step in range(13, 17):
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(step % 4, device=device),
+            info=info,
+            medium=torch.zeros(32, 32, 1, device=device),
+            surface=torch.ones(32, 32, 1, device=device),
+            responsibility_mass=_mass(device, count, 1),
+        )
+    assert bool(carrier.render_weights()["certified_surface"].all())
+
+
+def test_unobserved_updates_do_not_erase_cross_window_candidate():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    carrier = SurfaceCarrierField(
+        2,
+        device,
+        update_every=1,
+        min_distinct_views=3,
+        warmup_steps=0,
+        epoch_steps=5,
+    )
+    info = _projection_info(device, 2)
+    for step in range(11):
+        mass = torch.zeros(1, 2, 3, device=device)
+        if step % 5 in (0, 2, 4):
+            mass[0, 0, 0] = 20.0
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(step, device=device),
+            info=info,
+            responsibility_mass=mass,
+        )
+    assert bool(carrier.render_weights()["certified_medium"][0])
+    assert not bool(carrier.render_weights()["certified"][1])
+
+
+def test_geometric_counterevidence_preserves_real_surface_with_water_colored_pixels():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    count = 6
+    carrier = SurfaceCarrierField(
+        count,
+        device,
+        update_every=1,
+        min_distinct_views=3,
+        warmup_steps=0,
+        epoch_steps=4,
+    )
+    info = _projection_info(device, count)
+    for step in range(9):
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(step % 4, device=device),
+            info=info,
+            responsibility_mass=_mass(device, count, 0),
+            geometric_medium_support=torch.zeros(count, device=device),
+            geometric_surface_support=torch.ones(count, device=device),
+        )
+    assert bool(carrier.render_weights()["certified_surface"].all())
+    assert not bool(carrier.render_weights()["certified_medium"].any())
+
+
+def test_projection_geometry_support_separates_foreground_from_empty_water():
+    from types import SimpleNamespace
+
+    from seafree_gs.seafree_model import SeaFreeGsModel
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = object.__new__(SeaFreeGsModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(water_null_depth_threshold=1e-2)
+    model.info = {
+        "means2d": torch.tensor([[[4.0, 4.0], [12.0, 12.0]]], device=device),
+        "depths": torch.tensor([[2.0, 5.0]], device=device),
+        "radii": torch.ones(1, 2, device=device, dtype=torch.int32),
+    }
+    pseudo = torch.zeros(16, 16, 1, device=device)
+    pseudo[4, 4] = 1.0
+    rendered_depth = torch.full_like(pseudo, 5.0)
+    rendered_depth[4, 4] = 2.0
+    edge = torch.zeros_like(pseudo)
+    edge[4, 4] = 1.0
+    low_structure = torch.ones_like(pseudo)
+    water_advantage = torch.ones_like(pseudo)
+    medium, surface = model._gaussian_geometric_counterfactual_support(
+        pseudo,
+        rendered_depth,
+        edge,
+        low_structure,
+        water_advantage,
+    )
+    assert medium is not None and surface is not None
+    assert float(surface[0]) > float(medium[0])
+    assert float(medium[1]) > float(surface[1])
 
 
 def test_duplicate_and_split_children_require_new_evidence():
@@ -158,15 +330,23 @@ def test_duplicate_and_split_children_require_new_evidence():
     duplicate(params, optimizers, state, torch.tensor([False, True, False], device=device))
     carrier.sync_from_strategy_state(state)
     assert carrier.num_points == 4
-    assert float(carrier.medium_evidence[-1]) == 1.0
+    expected_duplicate_evidence = 0.5 + 0.35 * (3.0 - 0.5)
+    torch.testing.assert_close(
+        carrier.medium_evidence[-1], torch.tensor(expected_duplicate_evidence, device=device)
+    )
     assert int(carrier.certified_state[-1]) == carrier.UNCERTAIN
-    assert int(carrier.sfm_reliability[-1]) == 120
+    assert int(carrier.sfm_reliability[-1]) == round(160 * 0.85)
 
     split(params, optimizers, state, torch.tensor([True, False, False, False], device=device))
     carrier.sync_from_strategy_state(state)
     assert carrier.num_points == 5
-    torch.testing.assert_close(carrier.medium_evidence[-2:], torch.ones(2, device=device))
+    expected_split_evidence = 0.5 + 0.35 * (2.0 - 0.5)
+    torch.testing.assert_close(
+        carrier.medium_evidence[-2:],
+        torch.full((2,), expected_split_evidence, device=device),
+    )
     assert not bool(carrier.certified_state[-2:].any())
+    assert not bool(carrier.angular_coverage[-2:].any())
 
     remove(params, optimizers, state, torch.tensor([False, True, False, False, False], device=device))
     carrier.sync_from_strategy_state(state)
@@ -185,3 +365,109 @@ def test_strategy_state_rebinds_after_module_device_move():
     carrier.sync_from_strategy_state(state)
     assert state["carrier_surface_evidence"].device.type == "cuda"
     assert carrier.surface_evidence.data_ptr() == state["carrier_surface_evidence"].data_ptr()
+
+
+def test_full_view_ids_do_not_alias_above_sixty_three():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    carrier = SurfaceCarrierField(
+        3, device, update_every=1, min_distinct_views=2, warmup_steps=0, epoch_steps=20
+    )
+    info = _projection_info(device, 3)
+    for step, view_id in enumerate((1, 64)):
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(view_id, device=device),
+            info=info,
+            responsibility_mass=_mass(device, 3, 0),
+        )
+    assert int(carrier.angular_coverage.min()) == 2
+
+
+def test_pending_window_affects_render_and_can_be_committed_once():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    carrier = SurfaceCarrierField(
+        4, device, update_every=1, min_distinct_views=2, warmup_steps=0, epoch_steps=100
+    )
+    info = _projection_info(device, 4)
+    for step in range(3):
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(step, device=device),
+            info=info,
+            responsibility_mass=_mass(device, 4, 0),
+        )
+    assert bool((carrier.render_weights()["medium_fraction"] > 0.0).all())
+    before = carrier.medium_evidence.clone()
+    assert carrier.finalize_pending_window()
+    assert bool((carrier.medium_evidence > before).all())
+    assert not carrier.finalize_pending_window()
+
+
+def test_surface_medium_split_exactly_conserves_optical_thickness():
+    opacity = torch.tensor([0.0, 0.1, 0.5, 0.95])
+    surface_fraction = torch.tensor([0.0, 0.25, 0.7, 1.0])
+    surface, medium = SurfaceCarrierField.split_optical_thickness(
+        opacity, surface_fraction
+    )
+    recombined = 1.0 - (1.0 - surface) * (1.0 - medium)
+    torch.testing.assert_close(recombined, opacity, rtol=1e-6, atol=1e-7)
+    assert float(surface[0]) == 0.0 and float(medium[0]) == 0.0
+    assert float(medium[-1]) == 0.0
+
+
+def test_mixed_realistic_evidence_produces_nonzero_medium_ownership():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    count = 40
+    carrier = SurfaceCarrierField(
+        count,
+        device,
+        update_every=1,
+        min_distinct_views=4,
+        warmup_steps=0,
+        epoch_steps=8,
+    )
+    info = _projection_info(device, count)
+    mass = torch.zeros(1, count, 3, device=device)
+    mass[:, :16, 0] = 8.0
+    mass[:, :16, 1] = 3.0
+    mass[:, 16:, 0] = 2.0
+    mass[:, 16:, 1] = 9.0
+    for step in range(7):
+        carrier.update_from_responsibilities(
+            step=step,
+            view_id=torch.tensor(step, device=device),
+            info=info,
+            responsibility_mass=mass,
+        )
+    fractions = carrier.render_weights()["medium_fraction"]
+    assert float(fractions[:16].mean()) > 0.45
+    assert float(fractions[16:].mean()) < 0.05
+
+
+def test_high_opacity_alone_cannot_change_carrier_ownership():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    count = 8
+    low = SurfaceCarrierField(
+        count, device, update_every=1, min_distinct_views=3, warmup_steps=0, epoch_steps=4
+    )
+    high = SurfaceCarrierField(
+        count, device, update_every=1, min_distinct_views=3, warmup_steps=0, epoch_steps=4
+    )
+    low_info = _projection_info(device, count)
+    high_info = _projection_info(device, count)
+    low_info["opacities"] = torch.full((1, count), 0.01, device=device)
+    high_info["opacities"] = torch.full((1, count), 0.99, device=device)
+    for step in range(5):
+        kwargs = {
+            "step": step,
+            "view_id": torch.tensor(step, device=device),
+            "responsibility_mass": _mass(device, count, 0),
+        }
+        low.update_from_responsibilities(info=low_info, **kwargs)
+        high.update_from_responsibilities(info=high_info, **kwargs)
+    torch.testing.assert_close(
+        low.render_weights()["medium_fraction"],
+        high.render_weights()["medium_fraction"],
+        rtol=0.0,
+        atol=0.0,
+    )

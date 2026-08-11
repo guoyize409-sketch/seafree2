@@ -425,6 +425,7 @@ def rasterization(
         colors = color_transform(
             colors=colors,
             radii=radii,
+            means2d=means2d,
             depths=depths,
             camera_ids=camera_ids,
             gaussian_ids=gaussian_ids,

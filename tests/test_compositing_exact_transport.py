@@ -117,35 +117,61 @@ def test_two_segment_zero_field_reduces_to_base_formula():
         rtol=1e-6,
         atol=1e-7,
     )
-    assert field.planes.shape[1] == 3
+    assert field.planes.shape[1] == 4
 
 
-def test_nonzero_field_uses_shared_rgb_multipliers():
+def test_nonzero_field_is_spatially_varying_and_gateable():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     field = CompactHeterogeneousWaterField(resolution=8).to(device)
+    field.set_bounds(torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]], device=device))
     with torch.no_grad():
-        field.planes[:, 0].fill_(0.7)
-        field.planes[:, 1].fill_(0.5)
-        field.planes[:, 2].fill_(-0.4)
-    count = 11
-    positions = torch.randn(count, 3, device=device)
-    ambient = torch.tensor([0.2, 0.4, 0.6], device=device).expand(count, -1)
-    backscatter = torch.tensor([0.08, 0.16, 0.24], device=device).expand(count, -1)
-    attenuation = torch.tensor([0.30, 0.18, 0.09], device=device).expand(count, -1)
-    corrected_a, corrected_b, corrected_s, _ = field.apply_to_base(
+        field.free_space_support.fill_(1.0)
+        x_ramp = torch.linspace(-1.0, 1.0, 8, device=device).view(1, 1, 1, 1, 8)
+        field.volume[:, 0:1].copy_(0.8 * x_ramp.expand(1, 1, 8, 8, 8))
+        field.volume[:, 1:2].copy_(0.3 * x_ramp.expand(1, 1, 8, 8, 8))
+        field.volume[:, 2:3].copy_(-0.2 * x_ramp.expand(1, 1, 8, 8, 8))
+        field.volume[:, 3:4].copy_(0.4 * x_ramp.expand(1, 1, 8, 8, 8))
+    positions = torch.tensor([[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]], device=device)
+    ambient = torch.tensor([0.2, 0.4, 0.6], device=device).expand(2, -1)
+    backscatter = torch.tensor([0.08, 0.16, 0.24], device=device).expand(2, -1)
+    attenuation = torch.tensor([0.30, 0.18, 0.09], device=device).expand(2, -1)
+    corrected_a, corrected_b, corrected_s, residual = field.apply_to_base(
         ambient, backscatter, attenuation, positions
     )
-    torch.testing.assert_close(
-        corrected_b / backscatter,
-        (corrected_b / backscatter)[..., :1].expand_as(corrected_b),
+    assert not torch.allclose(residual[0], residual[1])
+    assert not torch.allclose(corrected_b[0], corrected_b[1])
+    assert not torch.allclose(corrected_s[0], corrected_s[1])
+    assert torch.all(torch.isfinite(corrected_a))
+    identity_a, identity_b, identity_s, _ = field.apply_to_base(
+        ambient,
+        backscatter,
+        attenuation,
+        positions,
+        spatial_gate=torch.zeros(2, device=device),
     )
-    torch.testing.assert_close(
-        corrected_s / attenuation,
-        (corrected_s / attenuation)[..., :1].expand_as(corrected_s),
+    torch.testing.assert_close(identity_a, ambient)
+    torch.testing.assert_close(identity_b, backscatter)
+    torch.testing.assert_close(identity_s, attenuation)
+
+
+def test_default_saft_field_has_compact_parameter_budget_and_surface_support():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    field = CompactHeterogeneousWaterField().to(device)
+    assert field.resolution == 16
+    assert sum(parameter.numel() for parameter in field.parameters()) == 4 * 16**3
+    field.set_bounds(torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]], device=device))
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.9, 0.9, 0.9], [-0.9, -0.9, -0.9]], device=device
     )
-    assert torch.all(corrected_a[:, 2] > corrected_a[:, 1])
-    assert torch.all(corrected_b[:, 2] > corrected_b[:, 1])
-    assert torch.all(corrected_s[:, 0] > corrected_s[:, 1])
+    field.update_free_space_support(
+        positions,
+        medium_probability=torch.tensor([0.0, 1.0, 1.0], device=device),
+        surface_probability=torch.tensor([1.0, 0.0, 0.0], device=device),
+        ema=0.0,
+    )
+    support = field._sample_free_space_support(positions).squeeze(-1)
+    assert float(support[0]) < float(support[1])
+    assert float(support[0]) < float(support[2])
 
 
 def test_zero_field_background_is_exactly_base_ambient():
@@ -170,6 +196,173 @@ def test_zero_field_background_is_exactly_base_ambient():
     torch.testing.assert_close(result["backscatter_radiance"], ambient, rtol=0.0, atol=0.0)
 
 
+def test_zero_field_prefix_is_exact_base_transport_without_device_sync_metadata():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    field = CompactHeterogeneousWaterField(resolution=8).to(device)
+    field.set_bounds(torch.tensor([[-2.0, -2.0, -1.0], [2.0, 2.0, 6.0]], device=device))
+    renderer = PathIntegratedWaterRenderer(
+        field, query_downscale=4, depth_scale=10.0, num_depth_bins=8
+    )
+    height, width = 32, 40
+    intrinsics = torch.tensor(
+        [[[50.0, 0.0, width / 2], [0.0, 50.0, height / 2], [0.0, 0.0, 1.0]]],
+        device=device,
+    )
+    camera_to_world = torch.eye(4, device=device).unsqueeze(0)
+    ambient_value = torch.tensor([0.18, 0.38, 0.48], device=device)
+    backscatter_value = torch.tensor([0.08, 0.16, 0.22], device=device)
+    attenuation_value = torch.tensor([0.30, 0.16, 0.08], device=device)
+
+    def fixed_properties(directions):
+        count = directions.shape[0]
+        return (
+            ambient_value.expand(count, -1),
+            backscatter_value.expand(count, -1),
+            attenuation_value.expand(count, -1),
+        )
+
+    prefix = renderer.build_frustum_prefix(
+        height,
+        width,
+        intrinsics,
+        camera_to_world,
+        torch.float32,
+        fixed_properties,
+        enabled=True,
+    )
+    assert isinstance(prefix["height"], int) and isinstance(prefix["width"], int)
+    means2d = torch.tensor([[20.0, 16.0], [8.0, 10.0], [31.0, 24.0]], device=device)
+    depths = torch.tensor([1.5, 3.0, 5.0], device=device)
+    visible_ids = torch.arange(3, device=device)
+    base_ambient = ambient_value.expand(3, -1)
+    base_backscatter = backscatter_value.expand(3, -1)
+    base_attenuation = attenuation_value.expand(3, -1)
+    dx = (means2d[:, 0] - intrinsics[0, 0, 2]) / intrinsics[0, 0, 0]
+    dy = (means2d[:, 1] - intrinsics[0, 1, 2]) / intrinsics[0, 1, 1]
+    ray_directions = torch.nn.functional.normalize(
+        torch.stack([dx, dy, torch.ones_like(dx)], dim=-1), dim=-1
+    )
+    distance = depths * torch.sqrt(dx * dx + dy * dy + 1.0)
+    path = renderer.sample_projected_paths(
+        prefix,
+        means2d,
+        depths,
+        visible_ids,
+        base_ambient,
+        base_backscatter,
+        base_attenuation,
+        ray_directions=ray_directions,
+        path_distances=distance,
+    )
+    normalized = (distance / 10.0)[:, None]
+    torch.testing.assert_close(
+        path["direct_transmittance"],
+        torch.exp(-base_attenuation * normalized),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        path["backscatter_radiance"],
+        base_ambient * (1.0 - torch.exp(-base_backscatter * normalized)),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    background = renderer.integrate_background_from_base(
+        ambient_value.expand(height, width, -1),
+        backscatter_value.expand(height, width, -1),
+        attenuation_value.expand(height, width, -1),
+        torch.zeros(height, width, 3, device=device),
+        camera_to_world[0, :3, 3],
+        enabled=True,
+        prefix=prefix,
+    )
+    assert torch.equal(
+        background["backscatter_radiance"], ambient_value.expand(height, width, -1)
+    )
+
+
+def test_prefix_transport_backpropagates_to_compact_volume():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    field = CompactHeterogeneousWaterField(resolution=8).to(device)
+    with torch.no_grad():
+        field.free_space_support.fill_(1.0)
+    renderer = PathIntegratedWaterRenderer(field, query_downscale=4, num_depth_bins=8)
+    intrinsics = torch.tensor(
+        [[[48.0, 0.0, 16.0], [0.0, 48.0, 16.0], [0.0, 0.0, 1.0]]], device=device
+    )
+    camera_to_world = torch.eye(4, device=device).unsqueeze(0)
+
+    def fixed_properties(directions):
+        count = directions.shape[0]
+        return (
+            directions.new_tensor([0.18, 0.38, 0.48]).expand(count, -1),
+            directions.new_tensor([0.08, 0.16, 0.22]).expand(count, -1),
+            directions.new_tensor([0.30, 0.16, 0.08]).expand(count, -1),
+        )
+
+    prefix = renderer.build_frustum_prefix(
+        32, 32, intrinsics, camera_to_world, torch.float32, fixed_properties, enabled=True
+    )
+    means2d = torch.tensor([[16.0, 16.0], [12.0, 20.0]], device=device)
+    depths = torch.tensor([1.0, 2.0], device=device)
+    dx = (means2d[:, 0] - intrinsics[0, 0, 2]) / intrinsics[0, 0, 0]
+    dy = (means2d[:, 1] - intrinsics[0, 1, 2]) / intrinsics[0, 1, 1]
+    ray_directions = torch.nn.functional.normalize(
+        torch.stack([dx, dy, torch.ones_like(dx)], dim=-1), dim=-1
+    )
+    distances = depths * torch.sqrt(dx * dx + dy * dy + 1.0)
+    path = renderer.sample_projected_paths(
+        prefix,
+        means2d,
+        depths,
+        torch.arange(2, device=device),
+        ray_directions=ray_directions,
+        path_distances=distances,
+    )
+    (path["direct_transmittance"].sum() + path["backscatter_radiance"].sum()).backward()
+    assert field.volume.grad is not None
+    assert torch.isfinite(field.volume.grad).all()
+    assert bool((field.volume.grad.abs() > 0).any())
+
+
+def test_configured_field_scales_control_spatial_correction_strength():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weak = CompactHeterogeneousWaterField(
+        resolution=8, ambient_residual_scale=0.01, coefficient_log_scale=0.05
+    ).to(device)
+    strong = CompactHeterogeneousWaterField(
+        resolution=8, ambient_residual_scale=0.20, coefficient_log_scale=0.60
+    ).to(device)
+    with torch.no_grad():
+        weak.volume[:, :, :, :, :4] = -0.8
+        weak.volume[:, :, :, :, 4:] = 0.8
+        strong.volume.copy_(weak.volume)
+        weak.free_space_support.fill_(1.0)
+        strong.free_space_support.fill_(1.0)
+    positions = torch.tensor([[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]], device=device)
+    weak_values = weak.multipliers(positions)
+    strong_values = strong.multipliers(positions)
+    weak_delta = sum((value - 1.0).abs().mean() for value in weak_values[:3])
+    strong_delta = sum((value - 1.0).abs().mean() for value in strong_values[:3])
+    assert float(strong_delta) > float(weak_delta)
+
+
+def test_unsupported_field_is_identity_even_with_nonzero_latents():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    field = CompactHeterogeneousWaterField(resolution=8).to(device)
+    with torch.no_grad():
+        field.volume.normal_(mean=0.0, std=0.5)
+    positions = torch.randn(7, 3, device=device)
+    ambient = torch.rand(7, 3, device=device)
+    backscatter = torch.rand(7, 3, device=device) + 0.05
+    attenuation = torch.rand(7, 3, device=device) + 0.05
+    corrected = field.apply_to_base(ambient, backscatter, attenuation, positions)
+    assert torch.equal(corrected[0], ambient)
+    assert torch.equal(corrected[1], backscatter)
+    assert torch.equal(corrected[2], attenuation)
+
+
 def test_freewater_observations_anchor_ambient_without_cpu_state():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     field = CompactHeterogeneousWaterField().to(device)
@@ -181,6 +374,72 @@ def test_freewater_observations_anchor_ambient_without_cpu_state():
     field.observe_freewater(image, responsibility, ema=0.0)
     assert not torch.allclose(field.ambient_anchor, before)
     torch.testing.assert_close(field.ambient_anchor, image[0, 0])
+
+
+def test_saft_block_coordinate_schedule_separates_field_from_appearance_and_wpp():
+    from types import SimpleNamespace
+
+    from seafree_gs.seafree_model import SeaFreeGsModel
+
+    model = object.__new__(SeaFreeGsModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        enable_path_integrated_transport=True,
+        water_field_start_step=15000,
+        water_field_freeze_step=23000,
+        water_field_update_every=4,
+    )
+    model.gauss_params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(torch.zeros(2, 3)),
+            "scales": torch.nn.Parameter(torch.zeros(2, 3)),
+            "quats": torch.nn.Parameter(torch.zeros(2, 4)),
+            "features_dc": torch.nn.Parameter(torch.zeros(2, 3)),
+            "features_rest": torch.nn.Parameter(torch.zeros(2, 3)),
+            "opacities": torch.nn.Parameter(torch.zeros(2, 1)),
+        }
+    )
+    model.line_of_sight_direction_encoding = torch.nn.Linear(3, 3)
+    model.water_properties_predictor = torch.nn.Linear(3, 9)
+    model.water_formation_calibrator = torch.nn.Linear(3, 9)
+    model.path_integrated_renderer = PathIntegratedWaterRenderer(
+        CompactHeterogeneousWaterField()
+    )
+    optimizers = SimpleNamespace(optimizers={})
+
+    class RecordingStrategy:
+        def __init__(self):
+            self.pre_backward_calls = 0
+
+        def step_pre_backward(self, *args, **kwargs):
+            self.pre_backward_calls += 1
+
+    model.strategy = RecordingStrategy()
+    model.strategy_state = {}
+    model.info = {"means2d": torch.zeros(1, 2, 2, requires_grad=False)}
+    model.train()
+
+    model.step_cb(optimizers, 15000)
+    assert model.path_integrated_renderer.field.volume.requires_grad
+    assert not model.gauss_params["features_dc"].requires_grad
+    assert not model.gauss_params["opacities"].requires_grad
+    assert not model.gauss_params["means"].requires_grad
+    assert not model.gauss_params["scales"].requires_grad
+    assert not model.gauss_params["quats"].requires_grad
+    assert not next(model.water_properties_predictor.parameters()).requires_grad
+    model._prepare_gaussian_densification_backward()
+    assert model.strategy.pre_backward_calls == 0
+
+    model.step_cb(optimizers, 15001)
+    assert not model.path_integrated_renderer.field.volume.requires_grad
+    assert model.gauss_params["features_dc"].requires_grad
+    assert model.gauss_params["opacities"].requires_grad
+    assert model.gauss_params["means"].requires_grad
+    assert model.gauss_params["scales"].requires_grad
+    assert model.gauss_params["quats"].requires_grad
+    assert next(model.water_properties_predictor.parameters()).requires_grad
+    model._prepare_gaussian_densification_backward()
+    assert model.strategy.pre_backward_calls == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat rasterization requires CUDA")
@@ -207,7 +466,10 @@ def test_projection_transform_uses_one_raster_and_backpropagates():
         device=device,
     )
 
+    received_projection = {}
+
     def transform(**projection):
+        received_projection.update(projection)
         return renderer.transform_projected_colors(
             projection["colors"],
             means,
@@ -235,6 +497,7 @@ def test_projection_transform_uses_one_raster_and_backpropagates():
     assert render.shape == (1, 64, 64, 7)
     assert alpha.shape == (1, 64, 64, 1)
     assert info["radii"].shape == (1, count)
+    assert received_projection["means2d"].data_ptr() == info["means2d"].data_ptr()
     assert float(info["gs_contributions"].sum()) > 0.0
     responsibilities = torch.zeros(1, 64, 64, 3, device=device)
     responsibilities[..., 0] = 1.0

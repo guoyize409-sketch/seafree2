@@ -11,11 +11,17 @@ from gsplat.utils import normalized_quat_to_rotmat
 
 
 def _carrier_child_state(name: str, parent: Tensor) -> Tensor:
-    """Reset ownership evidence after a Gaussian changes spatial support."""
+    """Retain a weak physical prior while requiring new angular evidence."""
     if name == "carrier_sfm_reliability":
-        return (parent.to(torch.float32) * 0.75).round().to(parent.dtype)
+        return (parent.to(torch.float32) * 0.85).round().to(parent.dtype)
     if name in ("carrier_medium_evidence", "carrier_surface_evidence"):
-        return torch.ones_like(parent)
+        return 0.5 + 0.35 * (parent - 0.5)
+    if name == "carrier_observation_mass":
+        return parent * 0.25
+    if name == "carrier_window_view_ids":
+        return torch.full_like(parent, -1)
+    if name in ("carrier_topology_medium_support", "carrier_topology_surface_support"):
+        return 0.5 + 0.25 * (parent - 0.5)
     return torch.zeros_like(parent)
 
 
