@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools==69.5.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seafree-gs"
+version = "0.1.0"
+description = "SeaFree-GS Nerfstudio method package"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "nerfstudio==1.1.5",
+    "numpy<2",
+]
+
+[project.urls]
+Homepage = "https://seafreegs.github.io/"
+Repository = "https://github.com/deng-ai-lab/SeaFree-GS"
+
+[tool.setuptools.packages.find]
+include = ["seafree_gs*"]
+
+[project.entry-points.'nerfstudio.method_configs']
+seafree-gs = "seafree_gs.seafree_config:SeaFreeGsMethod"
