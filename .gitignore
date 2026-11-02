@@ -30,6 +30,8 @@ Thumbs.db
 
 # Local outputs and experiment artifacts
 outputs/
+outputs_ablations/
+outputs2_ablations/
 render_results/
 wandb/
 runs/
